@@ -68,9 +68,13 @@ const JUMP_VEL  = 11.18 * 60; // ≈ 670.8 u/s
 const GRAV      = 0.958 * 3600; // ≈ 3448.8 u/s²
 const GROUND_Y  = 0;
 
-// Hitbox tuning
-const P_HITBOX  = BLOCK * 0.84;  // player collision box (slightly smaller than visual)
-const S_HITBOX  = BLOCK * 0.42;  // spike inner collision radius
+// Hitbox tuning (GD has separate hitbox/hurtbox)
+// Player INNER hitbox: small, for hazard detection (spikes). Makes spikes lenient.
+const P_HAZARD_BOX = BLOCK * 0.36;  // ~11 units, centered in player
+// Player OUTER hurtbox: full icon size, axis-aligned (no rotation), for solid blocks.
+const P_SOLID_BOX  = BLOCK;         // 30 units = full icon
+// Spike inner hitbox: small triangle inside the visual spike
+const S_HITBOX     = BLOCK * 0.28;  // very small inner collision
 
 // Camera
 const CAM_OFFSET_X = 160;   // units ahead of player
@@ -105,6 +109,7 @@ let colorAnims = [];   // running color animations
 let trigIdx = 0;        // next color trigger to check
 let inputHeld = false;
 let inputTap = false;
+let showHitboxes = false;  // toggle with 'H' key
 
 // Audio
 let music = null;
@@ -115,6 +120,11 @@ function isGameKey(e) {
     return e.code === 'Space' || e.code === 'ArrowUp' || e.key === 'w' || e.key === 'W';
 }
 function onPress(e) {
+    // Toggle hitbox debug with H
+    if (e.type === 'keydown' && (e.key === 'h' || e.key === 'H') && !e.repeat) {
+        showHitboxes = !showHitboxes;
+        return;
+    }
     if (e.type === 'keydown' && !isGameKey(e)) return;
     if (e.type === 'keydown' && e.repeat) return;
     e.preventDefault();
@@ -266,8 +276,9 @@ function physicsStep() {
 }
 
 function collideBlock(b) {
+    // Uses the OUTER hurtbox (full icon, axis-aligned, no rotation)
     const half_b = BLOCK / 2;
-    const half_p = P_HITBOX / 2;
+    const half_p = P_SOLID_BOX / 2;
 
     const dx = player.x - b.x;
     const dy = player.y - b.y;
@@ -298,30 +309,34 @@ function collideBlock(b) {
 }
 
 function collideSpike(s) {
+    // Spike collision uses the INNER hazard hitbox (small, lenient like real GD)
+    // Both the player's hazard box and the spike's inner box are small = very forgiving
     const dx = player.x - s.x;
     const dy = player.y - s.y;
 
-    // Quick AABB reject
-    const reach = P_HITBOX / 2 + S_HITBOX;
+    // Quick AABB reject using generous bounds
+    const reach = BLOCK;
     if (Math.abs(dx) > reach || Math.abs(dy) > reach) return false;
 
     // Normalize rotation to 0-360
     const r = (((s.r || 0) % 360) + 360) % 360;
 
-    // Spike tip offset (tip is the dangerous part)
-    const shift = BLOCK * 0.13;
-    let tipDx = 0, tipDy = 0;
-    if (r === 0)   tipDy =  shift; // tip points up
-    if (r === 90)  tipDx =  shift; // tip points right
-    if (r === 180) tipDy = -shift; // tip points down
-    if (r === 270) tipDx = -shift; // tip points left
+    // Spike danger zone: shifted toward the tip of the spike
+    // The base of the spike is safe, only the inner tip area kills
+    const tipShift = BLOCK * 0.18;
+    let sx = s.x, sy = s.y;
+    if (r === 0)   sy += tipShift;  // tip points up
+    if (r === 90)  sx += tipShift;  // tip points right
+    if (r === 180) sy -= tipShift;  // tip points down
+    if (r === 270) sx -= tipShift;  // tip points left
 
-    // Distance from player center to spike danger zone
-    const cdx = player.x - (s.x + tipDx);
-    const cdy = player.y - (s.y + tipDy);
-    const dist = Math.sqrt(cdx * cdx + cdy * cdy);
+    // AABB overlap between player's small inner hazard box and spike's inner hitbox
+    const pHalf = P_HAZARD_BOX / 2;
+    const sHalf = S_HITBOX / 2;
+    const overlapX = (pHalf + sHalf) - Math.abs(player.x - sx);
+    const overlapY = (pHalf + sHalf) - Math.abs(player.y - sy);
 
-    return dist < (P_HITBOX * 0.42 + S_HITBOX * 0.38);
+    return overlapX > 0 && overlapY > 0;
 }
 
 function die() {
@@ -462,6 +477,9 @@ function render() {
 
     // Player
     if (!player.dead) drawPlayer();
+
+    // Hitbox debug overlay
+    if (showHitboxes && !player.dead) drawHitboxes(c0, c1);
 
     // Death particles
     drawParticles();
@@ -646,6 +664,50 @@ function drawPlayer() {
     ctx.fillRect(-h + sz * 0.15, -h + sz * 0.55, sz * 0.7, sz * 0.12);
 
     ctx.restore();
+}
+
+function drawHitboxes(c0, c1) {
+    // Player outer hurtbox (solid collision, axis-aligned, NO rotation)
+    const [px, py] = w2s(player.x, player.y);
+    const outerPx = P_SOLID_BOX * SCALE;
+    ctx.strokeStyle = 'rgba(0,255,0,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(px - outerPx / 2, py - outerPx / 2, outerPx, outerPx);
+
+    // Player inner hazard hitbox (small, for spike collision)
+    const innerPx = P_HAZARD_BOX * SCALE;
+    ctx.strokeStyle = 'rgba(255,0,0,0.9)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px - innerPx / 2, py - innerPx / 2, innerPx, innerPx);
+
+    // Spike hitboxes nearby
+    for (let c = c0; c <= c1; c++) {
+        const ch = grid[c];
+        if (!ch) continue;
+        for (const s of ch.spikes) {
+            const r = (((s.r || 0) % 360) + 360) % 360;
+            const tipShift = BLOCK * 0.18;
+            let sx = s.x, sy = s.y;
+            if (r === 0)   sy += tipShift;
+            if (r === 90)  sx += tipShift;
+            if (r === 180) sy -= tipShift;
+            if (r === 270) sx -= tipShift;
+
+            const [ssx, ssy] = w2s(sx, sy);
+            const sPx = S_HITBOX * SCALE;
+            ctx.strokeStyle = 'rgba(255,100,100,0.6)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(ssx - sPx / 2, ssy - sPx / 2, sPx, sPx);
+        }
+        // Block hitboxes
+        for (const b of ch.blocks) {
+            const [bx, by] = w2s(b.x, b.y);
+            const bPx = BLOCK * SCALE;
+            ctx.strokeStyle = 'rgba(0,100,255,0.3)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(bx - bPx / 2, by - bPx / 2, bPx, bPx);
+        }
+    }
 }
 
 function drawParticles() {
