@@ -6,71 +6,86 @@
 <title>Every Single End 2 - GD Web Port</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: 'Segoe UI', sans-serif; }
-canvas { display: block; image-rendering: pixelated; }
-#ui-overlay {
-    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-    pointer-events: none; display: flex; flex-direction: column;
+body {
+    background: #000; overflow: hidden;
+    display: flex; justify-content: center; align-items: center;
+    height: 100vh; font-family: 'Pusab', 'Segoe UI', 'Arial Black', sans-serif;
+    user-select: none; -webkit-user-select: none;
 }
-#progress-bar-container {
-    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
-    width: 280px; height: 10px; background: rgba(0,0,0,0.5);
-    border-radius: 5px; border: 1px solid rgba(255,255,255,0.3);
+canvas { display: block; cursor: pointer; }
+#progress-container {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    width: 260px; height: 8px; background: rgba(0,0,0,0.4);
+    border-radius: 4px; border: 1px solid rgba(255,255,255,0.2);
+    z-index: 10;
 }
-#progress-bar {
-    height: 100%; width: 0%; background: #0f0; border-radius: 5px;
-    transition: width 0.1s linear;
+#progress-fill {
+    height: 100%; width: 0%; border-radius: 4px;
+    background: linear-gradient(90deg, #00ff00, #7dff00);
+    transition: width 0.15s linear;
 }
-#attempt-label {
-    position: absolute; top: 28px; left: 50%; transform: translateX(-50%);
-    color: rgba(255,255,255,0.7); font-size: 12px;
+#attempt-text {
+    position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.6); font-size: 11px; z-index: 10;
+    letter-spacing: 1px;
 }
-#death-screen {
-    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-    display: none; justify-content: center; align-items: center;
-    pointer-events: auto; cursor: pointer;
+#loading-screen {
+    position: absolute; inset: 0;
+    display: flex; justify-content: center; align-items: center;
+    background: #0a0a2e; color: #fff; font-size: 22px; z-index: 100;
+    flex-direction: column; gap: 12px;
 }
-#death-screen.show { display: flex; }
-#loading {
-    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    color: #fff; font-size: 24px;
+#loading-screen .spinner {
+    width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.2);
+    border-top-color: #7dff00; border-radius: 50%;
+    animation: spin 0.8s linear infinite;
 }
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
-<div id="ui-overlay">
-    <div id="progress-bar-container"><div id="progress-bar"></div></div>
-    <div id="attempt-label">Attempt 1</div>
-</div>
-<div id="death-screen"></div>
-<div id="loading">Loading level...</div>
+<div id="progress-container"><div id="progress-fill"></div></div>
+<div id="attempt-text">Attempt 1</div>
+<div id="loading-screen"><div class="spinner"></div><div>Loading level...</div></div>
 
 <script>
 'use strict';
 
-// ===== CONSTANTS =====
-const BLOCK_SIZE = 30;         // GD units per block
-const SCALE = 2.0;             // pixels per GD unit
-const PX = BLOCK_SIZE * SCALE; // pixels per block = 60
+// =========================================================================
+// GEOMETRY DASH WEB PORT - Cube Mode Engine
+// =========================================================================
 
-// Physics (GD cube mode, tuned to feel authentic)
-const PLAYER_SPEED = 311.58;   // units/sec at 1x speed
-const GRAVITY = 2400;          // units/sec^2
-const JUMP_VELOCITY = 580;     // units/sec upward
-const GROUND_Y = 0;            // ground surface in GD units
+// --- CONSTANTS (from GD reverse-engineering) ---
+const BLOCK = 30;           // 1 block = 30 GD units
+const SCALE = 2;            // render pixels per GD unit
+const PX = BLOCK * SCALE;   // 60px per block
 
-// Player
-const PLAYER_SIZE = BLOCK_SIZE;         // 30 units
-const PLAYER_HITBOX = BLOCK_SIZE * 0.85; // slightly smaller hitbox
-const SPIKE_HITBOX = BLOCK_SIZE * 0.45;  // spike inner hitbox
+// Physics at 60fps reference (converted to per-second for delta-time)
+// GD decompiled values: jumpAccel ≈ 11.18 u/frame, gravity ≈ 0.958 u/frame²
+const SPEED_1X  = 311.58;     // horizontal speed (units/sec)
+const JUMP_VEL  = 11.18 * 60; // ≈ 670.8 u/s
+const GRAV      = 0.958 * 3600; // ≈ 3448.8 u/s²
+const GROUND_Y  = 0;
+
+// Hitbox tuning
+const P_HITBOX  = BLOCK * 0.84;  // player collision box (slightly smaller than visual)
+const S_HITBOX  = BLOCK * 0.42;  // spike inner collision radius
 
 // Camera
-const CAM_LEAD = 200; // units ahead of player
+const CAM_OFFSET_X = 160;   // units ahead of player
+const CAM_LERP_Y   = 0.08;  // vertical smoothing
 
-// ===== CANVAS SETUP =====
+// Fixed physics step for consistency
+const PHYSICS_STEP = 1 / 240;
+let accumulator = 0;
+
+// --- DOM ---
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
+const progressFill = document.getElementById('progress-fill');
+const attemptText = document.getElementById('attempt-text');
+const loadingScreen = document.getElementById('loading-screen');
 
 function resize() {
     canvas.width = window.innerWidth;
@@ -79,635 +94,610 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// ===== GAME STATE =====
+// --- GAME STATE ---
 let level = null;
-let spatialGrid = {};  // chunk-based spatial index
-const CHUNK_SIZE = 300; // 10 blocks per chunk
+let grid = {};         // spatial hash
+const CHUNK = 300;     // chunk width in GD units
 
-let player = null;
-let camera = { x: 0, y: 0 };
-let input = { jump: false, jumpPressed: false };
-let attempt = 1;
-let gameState = 'loading'; // loading, playing, dead, complete
-let deathTimer = 0;
-let deathParticles = [];
-let activeColors = {};  // current color channel values
-let colorTriggerIndex = 0; // next color trigger to process
-let rotationAngle = 0; // player visual rotation
+let player, cam, rot, state, deathT, attempt, particles;
+let colorNow = {};     // active color channels {id: {r,g,b,a,blend}}
+let colorAnims = [];   // running color animations
+let trigIdx = 0;        // next color trigger to check
+let inputHeld = false;
+let inputTap = false;
 
-// ===== INPUT =====
-function onDown(e) {
-    if (e.type === 'keydown' && e.code !== 'Space' && e.code !== 'ArrowUp' && e.key !== 'w') return;
+// --- INPUT ---
+function isGameKey(e) {
+    return e.code === 'Space' || e.code === 'ArrowUp' || e.key === 'w' || e.key === 'W';
+}
+function onPress(e) {
+    if (e.type === 'keydown' && !isGameKey(e)) return;
+    if (e.type === 'keydown' && e.repeat) return;
     e.preventDefault();
-    if (gameState === 'dead') { restart(); return; }
-    if (gameState === 'playing') {
-        input.jump = true;
-        input.jumpPressed = true;
+    inputHeld = true;
+    inputTap = true;
+    if (state === 'dead') return;
+}
+function onRelease(e) {
+    if (e.type === 'keyup' && !isGameKey(e)) return;
+    inputHeld = false;
+}
+document.addEventListener('keydown', onPress);
+document.addEventListener('keyup', onRelease);
+canvas.addEventListener('mousedown', onPress);
+canvas.addEventListener('mouseup', onRelease);
+canvas.addEventListener('touchstart', onPress, { passive: false });
+canvas.addEventListener('touchend', onRelease);
+canvas.addEventListener('touchcancel', onRelease);
+
+// --- SPATIAL HASH ---
+function chunkOf(x) { return Math.floor(x / CHUNK); }
+
+function insertGrid(obj, type) {
+    const k = chunkOf(obj.x);
+    if (!grid[k]) grid[k] = { blocks: [], spikes: [], decos: [] };
+    grid[k][type].push(obj);
+}
+
+function queryGrid(px, radius, type) {
+    const out = [];
+    const c0 = chunkOf(px - radius), c1 = chunkOf(px + radius);
+    for (let c = c0; c <= c1; c++) {
+        const chunk = grid[c];
+        if (chunk && chunk[type]) out.push(...chunk[type]);
     }
-}
-function onUp(e) {
-    if (e.type === 'keyup' && e.code !== 'Space' && e.code !== 'ArrowUp' && e.key !== 'w') return;
-    input.jump = false;
+    return out;
 }
 
-document.addEventListener('keydown', onDown);
-document.addEventListener('keyup', onUp);
-canvas.addEventListener('mousedown', onDown);
-canvas.addEventListener('mouseup', onUp);
-canvas.addEventListener('touchstart', onDown, { passive: false });
-canvas.addEventListener('touchend', onUp);
-
-// ===== SPATIAL INDEXING =====
-function getChunkKey(x) {
-    return Math.floor(x / CHUNK_SIZE);
-}
-
-function buildSpatialGrid(objects, type) {
-    for (const obj of objects) {
-        const key = getChunkKey(obj.x);
-        if (!spatialGrid[key]) spatialGrid[key] = { blocks: [], spikes: [], decos: [] };
-        spatialGrid[key][type].push(obj);
-    }
-}
-
-function getObjectsNear(px, type) {
-    const results = [];
-    const chunk = getChunkKey(px);
-    for (let c = chunk - 1; c <= chunk + 1; c++) {
-        if (spatialGrid[c] && spatialGrid[c][type]) {
-            results.push(...spatialGrid[c][type]);
-        }
-    }
-    return results;
-}
-
-// ===== LEVEL LOADING =====
+// --- LOAD LEVEL ---
 async function loadLevel() {
-    const resp = await fetch('level.json');
-    level = await resp.json();
+    const r = await fetch('level.json');
+    level = await r.json();
 
-    // Build spatial index
-    spatialGrid = {};
-    buildSpatialGrid(level.blocks, 'blocks');
-    buildSpatialGrid(level.spikes, 'spikes');
-    buildSpatialGrid(level.decorations, 'decos');
+    grid = {};
+    for (const b of level.blocks)      insertGrid(b, 'blocks');
+    for (const s of level.spikes)      insertGrid(s, 'spikes');
+    for (const d of level.decorations) insertGrid(d, 'decos');
 
-    // Initialize colors
-    activeColors = {};
-    for (const [ch, col] of Object.entries(level.colors)) {
-        activeColors[ch] = { ...col };
+    // init color channels
+    colorNow = {};
+    for (const [id, c] of Object.entries(level.colors)) {
+        colorNow[id] = { r: c.r, g: c.g, b: c.b, a: c.opacity ?? 1, blend: c.blending ?? 0 };
     }
 
-    document.getElementById('loading').style.display = 'none';
+    loadingScreen.style.display = 'none';
+    attempt = 1;
     restart();
 }
 
-// ===== PLAYER =====
-function createPlayer() {
-    return {
-        x: -30,       // start slightly before the level
-        y: 105,        // above ground (will fall into position)
-        vy: 0,
-        onGround: false,
-        dead: false,
-        width: PLAYER_SIZE,
-        height: PLAYER_SIZE,
-    };
-}
-
+// --- RESTART ---
 function restart() {
-    player = createPlayer();
-    rotationAngle = 0;
-    deathParticles = [];
-    gameState = 'playing';
-    colorTriggerIndex = 0;
+    player = { x: 0, y: BLOCK / 2 + GROUND_Y, vy: 0, grounded: false, dead: false };
+    cam = { x: CAM_OFFSET_X, y: 150 };
+    rot = 0;
+    state = 'playing';
+    deathT = 0;
+    particles = [];
+    trigIdx = 0;
+    colorAnims = [];
+    inputTap = false;
 
     // Reset colors
-    activeColors = {};
-    for (const [ch, col] of Object.entries(level.colors)) {
-        activeColors[ch] = { ...col };
+    colorNow = {};
+    for (const [id, c] of Object.entries(level.colors)) {
+        colorNow[id] = { r: c.r, g: c.g, b: c.b, a: c.opacity ?? 1, blend: c.blending ?? 0 };
     }
 
-    document.getElementById('death-screen').classList.remove('show');
-    document.getElementById('attempt-label').textContent = `Attempt ${attempt}`;
-    input.jump = false;
-    input.jumpPressed = false;
+    attemptText.textContent = `Attempt ${attempt}`;
 }
 
-// ===== PHYSICS =====
-function updatePlayer(dt) {
+// --- PHYSICS ---
+function physicsStep() {
     if (player.dead) return;
+    const dt = PHYSICS_STEP;
 
-    // Horizontal movement
-    player.x += PLAYER_SPEED * dt;
+    // Move right
+    player.x += SPEED_1X * dt;
 
-    // Gravity
-    player.vy -= GRAVITY * dt;
+    // Gravity + vertical movement
+    player.vy -= GRAV * dt;
     player.y += player.vy * dt;
 
-    // Rotation (visual only)
-    if (!player.onGround) {
-        rotationAngle -= 400 * dt; // degrees per second
+    // Visual rotation
+    if (!player.grounded) {
+        rot -= 6.5 * dt * 60; // ~390 deg/s
     } else {
-        // Snap to nearest 90 degrees
-        rotationAngle = Math.round(rotationAngle / 90) * 90;
+        rot = Math.round(rot / 90) * 90;
     }
 
-    player.onGround = false;
+    player.grounded = false;
 
-    // Ground collision
-    const halfH = PLAYER_SIZE / 2;
-    if (player.y - halfH < GROUND_Y) {
-        player.y = GROUND_Y + halfH;
+    // Ground
+    if (player.y - BLOCK / 2 < GROUND_Y) {
+        player.y = GROUND_Y + BLOCK / 2;
         player.vy = 0;
-        player.onGround = true;
+        player.grounded = true;
     }
 
     // Block collisions
-    const nearBlocks = getObjectsNear(player.x, 'blocks');
-    for (const block of nearBlocks) {
-        resolveBlockCollision(block);
+    const near = queryGrid(player.x, BLOCK * 2, 'blocks');
+    for (const b of near) {
+        collideBlock(b);
+        if (player.dead) return;
     }
 
     // Spike collisions
-    const nearSpikes = getObjectsNear(player.x, 'spikes');
-    for (const spike of nearSpikes) {
-        if (checkSpikeCollision(spike)) {
-            die();
-            return;
-        }
+    const spikes = queryGrid(player.x, BLOCK * 2, 'spikes');
+    for (const s of spikes) {
+        if (collideSpike(s)) { die(); return; }
     }
 
-    // Jump
-    if (input.jumpPressed && player.onGround) {
-        player.vy = JUMP_VELOCITY;
-        player.onGround = false;
-        input.jumpPressed = false;
+    // Jump: in GD cube, holding = jump immediately when grounded
+    if (inputHeld && player.grounded) {
+        player.vy = JUMP_VEL;
+        player.grounded = false;
+    } else if (inputTap && player.grounded) {
+        player.vy = JUMP_VEL;
+        player.grounded = false;
+        inputTap = false;
     }
 
-    // Ceiling death (out of bounds)
-    if (player.y < -BLOCK_SIZE * 2) {
-        die();
-    }
+    // Fall out of bounds
+    if (player.y < GROUND_Y - BLOCK * 5) die();
 
     // Level complete
-    if (player.x > level.maxX + 300) {
-        gameState = 'complete';
-    }
+    if (player.x > level.maxX + 200) state = 'complete';
 }
 
-function resolveBlockCollision(block) {
-    const bx = block.x, by = block.y;
-    const bs = BLOCK_SIZE;
-    const ph = PLAYER_HITBOX;
+function collideBlock(b) {
+    const half_b = BLOCK / 2;
+    const half_p = P_HITBOX / 2;
 
-    // AABB overlap check
-    const dx = player.x - bx;
-    const dy = player.y - by;
-    const overlapX = (ph / 2 + bs / 2) - Math.abs(dx);
-    const overlapY = (ph / 2 + bs / 2) - Math.abs(dy);
+    const dx = player.x - b.x;
+    const dy = player.y - b.y;
+    const ox = half_p + half_b - Math.abs(dx);
+    const oy = half_p + half_b - Math.abs(dy);
 
-    if (overlapX <= 0 || overlapY <= 0) return;
+    if (ox <= 0 || oy <= 0) return; // no overlap
 
-    // Resolve collision on the axis with smallest overlap
-    if (overlapY < overlapX) {
+    if (oy < ox) {
+        // Vertical resolution
         if (dy > 0) {
             // Landing on top
-            player.y = by + bs / 2 + PLAYER_SIZE / 2;
+            player.y = b.y + half_b + BLOCK / 2;
             if (player.vy < 0) player.vy = 0;
-            player.onGround = true;
+            player.grounded = true;
         } else {
-            // Hitting from below
-            player.y = by - bs / 2 - PLAYER_SIZE / 2;
+            // Hit ceiling
+            player.y = b.y - half_b - BLOCK / 2;
             if (player.vy > 0) player.vy = 0;
         }
     } else {
-        if (dx > 0) {
-            // Hitting block from right side (player moving into it) = death in GD
+        // Horizontal = side collision = death in GD
+        if (dx >= 0) {
+            // Running into block from the right
             die();
-        } else {
-            // Shouldn't happen in normal play
-            player.x = bx - bs / 2 - PLAYER_SIZE / 2;
         }
     }
 }
 
-function checkSpikeCollision(spike) {
-    const sx = spike.x, sy = spike.y;
-    const rot = spike.r || 0;
-    const ph = PLAYER_HITBOX;
+function collideSpike(s) {
+    const dx = player.x - s.x;
+    const dy = player.y - s.y;
 
-    // Simple distance-based check with inner hitbox
-    const dx = player.x - sx;
-    const dy = player.y - sy;
+    // Quick AABB reject
+    const reach = P_HITBOX / 2 + S_HITBOX;
+    if (Math.abs(dx) > reach || Math.abs(dy) > reach) return false;
 
-    // Rectangular proximity check first
-    if (Math.abs(dx) > (ph / 2 + SPIKE_HITBOX / 2)) return false;
-    if (Math.abs(dy) > (ph / 2 + SPIKE_HITBOX / 2)) return false;
+    // Spike orientation (default: tip points UP, base at bottom)
+    const r = ((s.r || 0) % 360 + 360) % 360;
 
-    // Triangular hitbox approximation based on rotation
-    const normRot = ((rot % 360) + 360) % 360;
-    const tipX = sx + (normRot === 90 ? BLOCK_SIZE * 0.3 : normRot === 270 ? -BLOCK_SIZE * 0.3 : 0);
-    const tipY = sy + (normRot === 0 ? BLOCK_SIZE * 0.3 : normRot === 180 ? -BLOCK_SIZE * 0.3 : 0);
+    // The spike hitbox is an inner triangle. Approximate with a diamond/circle
+    // shifted toward the tip direction.
+    let tipDx = 0, tipDy = 0;
+    const shift = BLOCK * 0.12;
+    if (r === 0)   tipDy =  shift; // up
+    if (r === 90 || r === -270)  tipDx =  shift; // right
+    if (r === 180 || r === -180) tipDy = -shift; // down
+    if (r === 270 || r === -90)  tipDx = -shift; // left
 
-    const distToTip = Math.sqrt((player.x - tipX) ** 2 + (player.y - tipY) ** 2);
-    return distToTip < (ph / 2 + SPIKE_HITBOX * 0.4);
+    const cdx = player.x - (s.x + tipDx);
+    const cdy = player.y - (s.y + tipDy);
+    const dist = Math.sqrt(cdx * cdx + cdy * cdy);
+
+    return dist < (P_HITBOX / 2 + S_HITBOX * 0.35);
 }
 
 function die() {
     if (player.dead) return;
     player.dead = true;
-    gameState = 'dead';
-    deathTimer = 0;
+    state = 'dead';
+    deathT = 0;
     attempt++;
 
-    // Create death particles
-    deathParticles = [];
-    for (let i = 0; i < 20; i++) {
-        const angle = (Math.PI * 2 * i) / 20 + Math.random() * 0.3;
-        const speed = 100 + Math.random() * 200;
-        deathParticles.push({
+    // Burst particles
+    particles = [];
+    for (let i = 0; i < 24; i++) {
+        const a = (Math.PI * 2 * i) / 24 + Math.random() * 0.3;
+        const spd = 80 + Math.random() * 250;
+        particles.push({
             x: player.x, y: player.y,
-            vx: Math.cos(angle) * speed,
-            vy: Math.sin(angle) * speed,
-            size: 3 + Math.random() * 6,
-            life: 1.0,
+            vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+            sz: 2 + Math.random() * 5, life: 1,
         });
     }
 }
 
-// ===== COLOR TRIGGERS =====
-function processColorTriggers() {
-    if (!level.colorTriggers) return;
-    while (colorTriggerIndex < level.colorTriggers.length) {
-        const ct = level.colorTriggers[colorTriggerIndex];
-        if (player.x >= ct.x) {
-            const ch = String(ct.ch);
-            if (!activeColors[ch]) {
-                activeColors[ch] = { r: 255, g: 255, b: 255, blending: 0, opacity: 1 };
-            }
-            // For now, apply instantly (duration=0 or snap)
-            activeColors[ch].r = ct.r;
-            activeColors[ch].g = ct.g;
-            activeColors[ch].b = ct.b;
-            if (ct.blending !== undefined) activeColors[ch].blending = ct.blending;
-            if (ct.opacity !== undefined) activeColors[ch].opacity = ct.opacity;
-            colorTriggerIndex++;
+// --- COLOR TRIGGERS ---
+function updateColors(dt) {
+    // Activate new triggers
+    const triggers = level.colorTriggers;
+    while (trigIdx < triggers.length && player.x >= triggers[trigIdx].x) {
+        const t = triggers[trigIdx];
+        const ch = String(t.ch);
+        if (!colorNow[ch]) colorNow[ch] = { r: 255, g: 255, b: 255, a: 1, blend: 0 };
+
+        if (t.duration <= 0) {
+            // Instant
+            colorNow[ch].r = t.r;
+            colorNow[ch].g = t.g;
+            colorNow[ch].b = t.b;
+            colorNow[ch].blend = t.blending ?? 0;
+            if (t.opacity !== undefined) colorNow[ch].a = t.opacity;
         } else {
-            break;
+            // Animated
+            colorAnims.push({
+                ch, elapsed: 0, dur: t.duration,
+                fromR: colorNow[ch].r, fromG: colorNow[ch].g, fromB: colorNow[ch].b,
+                toR: t.r, toG: t.g, toB: t.b,
+                blend: t.blending ?? colorNow[ch].blend,
+            });
         }
+        trigIdx++;
+    }
+
+    // Animate running color transitions
+    for (let i = colorAnims.length - 1; i >= 0; i--) {
+        const a = colorAnims[i];
+        a.elapsed += dt;
+        const t = Math.min(a.elapsed / a.dur, 1);
+        const col = colorNow[a.ch];
+        if (col) {
+            col.r = Math.round(a.fromR + (a.toR - a.fromR) * t);
+            col.g = Math.round(a.fromG + (a.toG - a.fromG) * t);
+            col.b = Math.round(a.fromB + (a.toB - a.fromB) * t);
+            col.blend = a.blend;
+        }
+        if (t >= 1) colorAnims.splice(i, 1);
     }
 }
 
-// ===== RENDERING =====
-function getColor(channelId) {
-    const ch = String(channelId);
-    const col = activeColors[ch];
-    if (col) return `rgb(${col.r},${col.g},${col.b})`;
-    // Default channel colors
-    if (channelId === 0) return 'rgb(255,255,255)';
-    return 'rgb(255,255,255)';
-}
-
-function getColorObj(channelId) {
-    const ch = String(channelId);
-    return activeColors[ch] || { r: 255, g: 255, b: 255, blending: 0, opacity: 1 };
-}
-
+// --- CAMERA ---
 function updateCamera() {
-    const targetX = player.x + CAM_LEAD;
-    camera.x = targetX;
+    cam.x = player.x + CAM_OFFSET_X;
 
-    // Camera Y: follow player but keep ground visible
-    const screenUnitsH = (canvas.height / SCALE) / 2;
-    const minCamY = screenUnitsH - BLOCK_SIZE * 2; // show some ground
-    const targetY = Math.max(player.y, minCamY);
-    camera.y += (targetY - camera.y) * 0.1; // smooth follow
+    // Y: follow player with smooth tracking, keep ground visible
+    const halfH = (canvas.height / SCALE) / 2;
+    const minY = halfH - BLOCK;
+    const target = Math.max(player.y + BLOCK * 2, minY);
+    cam.y += (target - cam.y) * CAM_LERP_Y;
 }
 
-function worldToScreen(wx, wy) {
+// --- RENDERING ---
+function w2s(wx, wy) {
     return [
-        (wx - camera.x) * SCALE + canvas.width / 2,
-        canvas.height / 2 - (wy - camera.y) * SCALE
+        (wx - cam.x) * SCALE + canvas.width / 2,
+        canvas.height / 2 - (wy - cam.y) * SCALE
     ];
 }
 
+function col(chId) {
+    const c = colorNow[String(chId)];
+    return c ? c : { r: 255, g: 255, b: 255, a: 1, blend: 0 };
+}
+function rgb(c) { return `rgb(${c.r},${c.g},${c.b})`; }
+function rgba(c, a) { return `rgba(${c.r},${c.g},${c.b},${a})`; }
+
 function render() {
-    const w = canvas.width, h = canvas.height;
+    const W = canvas.width, H = canvas.height;
 
-    // Background
-    const bgCol = getColorObj(1000);
-    ctx.fillStyle = `rgb(${bgCol.r},${bgCol.g},${bgCol.b})`;
-    ctx.fillRect(0, 0, w, h);
+    // Background gradient
+    const bg = col(1000);
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, `rgb(${Math.max(0,bg.r-30)},${Math.max(0,bg.g-30)},${Math.max(0,bg.b-30)})`);
+    bgGrad.addColorStop(1, rgb(bg));
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
 
-    // Calculate visible range in world units
-    const viewLeft = camera.x - w / SCALE / 2 - BLOCK_SIZE;
-    const viewRight = camera.x + w / SCALE / 2 + BLOCK_SIZE;
-    const viewBottom = camera.y - h / SCALE / 2 - BLOCK_SIZE;
-    const viewTop = camera.y + h / SCALE / 2 + BLOCK_SIZE;
+    // Visible range
+    const vl = cam.x - W / SCALE / 2 - BLOCK * 2;
+    const vr = cam.x + W / SCALE / 2 + BLOCK * 2;
+    const vb = cam.y - H / SCALE / 2 - BLOCK * 2;
+    const vt = cam.y + H / SCALE / 2 + BLOCK * 2;
 
     // Ground
-    renderGround(viewLeft, viewRight);
+    drawGround();
 
-    // Render decorations
-    renderDecorations(viewLeft, viewRight, viewBottom, viewTop);
+    // Objects by chunk
+    const c0 = chunkOf(vl), c1 = chunkOf(vr);
+    for (let c = c0; c <= c1; c++) {
+        const ch = grid[c];
+        if (!ch) continue;
 
-    // Render blocks
-    renderBlocks(viewLeft, viewRight, viewBottom, viewTop);
-
-    // Render spikes
-    renderSpikes(viewLeft, viewRight, viewBottom, viewTop);
-
-    // Render player
-    if (!player.dead) {
-        renderPlayer();
+        // Decorations (behind blocks)
+        for (const d of ch.decos) {
+            if (d.x < vl || d.x > vr) continue;
+            drawDeco(d);
+        }
+        // Blocks
+        for (const b of ch.blocks) {
+            if (b.x < vl || b.x > vr || b.y < vb || b.y > vt) continue;
+            drawBlock(b);
+        }
+        // Spikes
+        for (const s of ch.spikes) {
+            if (s.x < vl || s.x > vr || s.y < vb || s.y > vt) continue;
+            drawSpike(s);
+        }
     }
 
-    // Death particles
-    renderDeathParticles();
+    // Player
+    if (!player.dead) drawPlayer();
 
-    // Progress bar
-    const progress = Math.max(0, Math.min(1, player.x / level.maxX));
-    document.getElementById('progress-bar').style.width = (progress * 100) + '%';
+    // Death particles
+    drawParticles();
+
+    // Progress
+    const pct = Math.max(0, Math.min(100, (player.x / level.maxX) * 100));
+    progressFill.style.width = pct + '%';
 }
 
-function renderGround(viewLeft, viewRight) {
-    const gCol = getColorObj(1001);
-    const [, groundScreenY] = worldToScreen(0, GROUND_Y);
+function drawGround() {
+    const gc = col(1001);
+    const lc = col(1002);
+    const [, gy] = w2s(0, GROUND_Y);
 
-    // Ground fill
-    ctx.fillStyle = `rgb(${gCol.r},${gCol.g},${gCol.b})`;
-    ctx.fillRect(0, groundScreenY, canvas.width, canvas.height - groundScreenY);
+    // Ground body
+    const gGrad = ctx.createLinearGradient(0, gy, 0, gy + 200);
+    gGrad.addColorStop(0, rgb(gc));
+    gGrad.addColorStop(1, `rgb(${Math.max(0,gc.r-40)},${Math.max(0,gc.g-40)},${Math.max(0,gc.b-40)})`);
+    ctx.fillStyle = gGrad;
+    ctx.fillRect(0, gy, canvas.width, canvas.height);
 
-    // Ground line
-    const lineCol = getColorObj(1002);
-    ctx.strokeStyle = `rgb(${lineCol.r},${lineCol.g},${lineCol.b})`;
-    ctx.lineWidth = 2;
+    // Ground line (white)
+    ctx.strokeStyle = rgb(lc);
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
-    ctx.moveTo(0, groundScreenY);
-    ctx.lineTo(canvas.width, groundScreenY);
+    ctx.moveTo(0, gy);
+    ctx.lineTo(canvas.width, gy);
     ctx.stroke();
 }
 
-function renderBlocks(viewLeft, viewRight, viewBottom, viewTop) {
-    const chunkLeft = getChunkKey(viewLeft);
-    const chunkRight = getChunkKey(viewRight);
+function drawBlock(b) {
+    const [sx, sy] = w2s(b.x, b.y);
+    const sz = BLOCK * SCALE;
+    const h = sz / 2;
 
-    const objCol = getColorObj(1005);
-    const lineCol = getColorObj(1002);
-    const tdlCol = getColorObj(1004);
-
-    for (let c = chunkLeft; c <= chunkRight; c++) {
-        const chunk = spatialGrid[c];
-        if (!chunk || !chunk.blocks) continue;
-
-        for (const block of chunk.blocks) {
-            if (block.x < viewLeft || block.x > viewRight) continue;
-            if (block.y < viewBottom || block.y > viewTop) continue;
-
-            const [sx, sy] = worldToScreen(block.x, block.y);
-            const size = BLOCK_SIZE * SCALE;
-            const half = size / 2;
-
-            // Get object-specific color or default
-            const bCol = block.c ? getColorObj(block.c) : objCol;
-
-            ctx.save();
-            ctx.translate(sx, sy);
-            if (block.r) ctx.rotate(-block.r * Math.PI / 180);
-
-            // Block fill
-            ctx.fillStyle = `rgb(${bCol.r},${bCol.g},${bCol.b})`;
-            ctx.fillRect(-half, -half, size, size);
-
-            // Block outline
-            ctx.strokeStyle = `rgb(${lineCol.r},${lineCol.g},${lineCol.b})`;
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(-half, -half, size, size);
-
-            // Inner detail based on block type
-            renderBlockDetail(block.id, half, size, tdlCol);
-
-            ctx.restore();
-        }
-    }
-}
-
-function renderBlockDetail(id, half, size, tdlCol) {
-    ctx.strokeStyle = `rgba(${tdlCol.r},${tdlCol.g},${tdlCol.b},0.3)`;
-    ctx.lineWidth = 1;
-
-    switch (id) {
-        case 1: // Plain block - no detail
-            break;
-        case 2: // Diagonal line block
-            ctx.beginPath();
-            ctx.moveTo(-half, half);
-            ctx.lineTo(half, -half);
-            ctx.stroke();
-            break;
-        case 3: // X pattern
-            ctx.beginPath();
-            ctx.moveTo(-half, half);
-            ctx.lineTo(half, -half);
-            ctx.moveTo(-half, -half);
-            ctx.lineTo(half, half);
-            ctx.stroke();
-            break;
-        case 4: // Dot pattern
-            ctx.fillStyle = `rgba(${tdlCol.r},${tdlCol.g},${tdlCol.b},0.3)`;
-            const d = size / 4;
-            for (let dx = -1; dx <= 1; dx += 2) {
-                for (let dy = -1; dy <= 1; dy += 2) {
-                    ctx.beginPath();
-                    ctx.arc(dx * d * 0.6, dy * d * 0.6, 2, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-            }
-            break;
-        case 5: // Outline/breakable - inner rectangle
-            ctx.strokeRect(-half + 4, -half + 4, size - 8, size - 8);
-            break;
-        case 6: // Brick pattern
-            ctx.beginPath();
-            ctx.moveTo(-half, 0);
-            ctx.lineTo(half, 0);
-            ctx.moveTo(0, -half);
-            ctx.lineTo(0, 0);
-            ctx.moveTo(-half + size * 0.3, 0);
-            ctx.lineTo(-half + size * 0.3, half);
-            ctx.stroke();
-            break;
-        case 7: // Half block (same size but different visual)
-            ctx.beginPath();
-            ctx.moveTo(-half, 0);
-            ctx.lineTo(half, 0);
-            ctx.stroke();
-            break;
-    }
-}
-
-function renderSpikes(viewLeft, viewRight, viewBottom, viewTop) {
-    const chunkLeft = getChunkKey(viewLeft);
-    const chunkRight = getChunkKey(viewRight);
-
-    for (let c = chunkLeft; c <= chunkRight; c++) {
-        const chunk = spatialGrid[c];
-        if (!chunk || !chunk.spikes) continue;
-
-        for (const spike of chunk.spikes) {
-            if (spike.x < viewLeft || spike.x > viewRight) continue;
-            if (spike.y < viewBottom || spike.y > viewTop) continue;
-
-            const [sx, sy] = worldToScreen(spike.x, spike.y);
-            const size = BLOCK_SIZE * SCALE;
-            const half = size / 2;
-
-            const sCol = spike.c ? getColorObj(spike.c) : getColorObj(1005);
-            const lineCol = getColorObj(1002);
-
-            ctx.save();
-            ctx.translate(sx, sy);
-            if (spike.r) ctx.rotate(-spike.r * Math.PI / 180);
-
-            // Draw spike triangle (pointing up by default)
-            ctx.beginPath();
-            ctx.moveTo(0, -half);           // tip
-            ctx.lineTo(-half, half);        // bottom left
-            ctx.lineTo(half, half);         // bottom right
-            ctx.closePath();
-
-            ctx.fillStyle = `rgb(${sCol.r},${sCol.g},${sCol.b})`;
-            ctx.fill();
-            ctx.strokeStyle = `rgb(${lineCol.r},${lineCol.g},${lineCol.b})`;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-
-            ctx.restore();
-        }
-    }
-}
-
-function renderDecorations(viewLeft, viewRight, viewBottom, viewTop) {
-    const chunkLeft = getChunkKey(viewLeft);
-    const chunkRight = getChunkKey(viewRight);
-
-    for (let c = chunkLeft; c <= chunkRight; c++) {
-        const chunk = spatialGrid[c];
-        if (!chunk || !chunk.decos) continue;
-
-        for (const deco of chunk.decos) {
-            if (deco.x < viewLeft || deco.x > viewRight) continue;
-
-            const [sx, sy] = worldToScreen(deco.x, deco.y);
-            const size = BLOCK_SIZE * SCALE;
-
-            if (deco.id === 1715) {
-                // Ground decoration line
-                const col = deco.c ? getColorObj(deco.c) : getColorObj(1002);
-                ctx.strokeStyle = `rgba(${col.r},${col.g},${col.b},0.5)`;
-                ctx.lineWidth = 1;
-                ctx.beginPath();
-                ctx.moveTo(sx - size / 2, sy);
-                ctx.lineTo(sx + size / 2, sy);
-                ctx.stroke();
-            }
-        }
-    }
-}
-
-function renderPlayer() {
-    const [sx, sy] = worldToScreen(player.x, player.y);
-    const size = PLAYER_SIZE * SCALE;
-    const half = size / 2;
+    const bc = b.c ? col(b.c) : col(1005);
+    const lc = col(1002);
 
     ctx.save();
     ctx.translate(sx, sy);
-    ctx.rotate(rotationAngle * Math.PI / 180);
+    if (b.r) ctx.rotate(-b.r * Math.PI / 180);
 
-    // Player cube body
-    ctx.fillStyle = '#7dff00'; // GD green
-    ctx.fillRect(-half, -half, size, size);
+    // 3D shadow effect (GD style: darker bottom-right)
+    ctx.fillStyle = `rgba(0,0,0,0.18)`;
+    ctx.fillRect(-h + 2, -h + 2, sz, sz);
+
+    // Block body
+    ctx.fillStyle = rgb(bc);
+    ctx.fillRect(-h, -h, sz, sz);
 
     // Outline
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(-half, -half, size, size);
+    ctx.strokeStyle = rgb(lc);
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(-h, -h, sz, sz);
 
-    // Icon detail (simple face)
-    ctx.fillStyle = '#fff';
-    // Eyes
-    ctx.fillRect(-half + size * 0.25, -half + size * 0.2, size * 0.15, size * 0.2);
-    ctx.fillRect(-half + size * 0.6, -half + size * 0.2, size * 0.15, size * 0.2);
+    // Inner detail per block type
+    drawBlockInner(b.id, h, sz, lc);
 
     ctx.restore();
 }
 
-function renderDeathParticles() {
-    for (const p of deathParticles) {
+function drawBlockInner(id, h, sz, lc) {
+    const a = 0.25;
+    ctx.strokeStyle = rgba(lc, a);
+    ctx.fillStyle = rgba(lc, a);
+    ctx.lineWidth = 1;
+
+    switch (id) {
+        case 2: // diagonal
+            ctx.beginPath();
+            ctx.moveTo(-h, h); ctx.lineTo(h, -h);
+            ctx.stroke();
+            break;
+        case 3: // X
+            ctx.beginPath();
+            ctx.moveTo(-h, h); ctx.lineTo(h, -h);
+            ctx.moveTo(-h, -h); ctx.lineTo(h, h);
+            ctx.stroke();
+            break;
+        case 4: // border highlight
+            ctx.strokeRect(-h + 5, -h + 5, sz - 10, sz - 10);
+            break;
+        case 5: // inner square
+            ctx.strokeStyle = rgba(lc, 0.15);
+            ctx.strokeRect(-h + 6, -h + 6, sz - 12, sz - 12);
+            break;
+        case 6: // brick
+            ctx.beginPath();
+            ctx.moveTo(-h, 0); ctx.lineTo(h, 0);
+            ctx.moveTo(0, -h); ctx.lineTo(0, 0);
+            ctx.moveTo(h * 0.5, 0); ctx.lineTo(h * 0.5, h);
+            ctx.stroke();
+            break;
+        case 7: // half line
+            ctx.beginPath();
+            ctx.moveTo(-h, 0); ctx.lineTo(h, 0);
+            ctx.stroke();
+            break;
+    }
+}
+
+function drawSpike(s) {
+    const [sx, sy] = w2s(s.x, s.y);
+    const sz = BLOCK * SCALE;
+    const h = sz / 2;
+
+    const sc = s.c ? col(s.c) : col(1005);
+    const lc = col(1002);
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    if (s.r) ctx.rotate(-s.r * Math.PI / 180);
+
+    // Shadow
+    ctx.beginPath();
+    ctx.moveTo(1, -h + 3);
+    ctx.lineTo(-h + 1, h + 1);
+    ctx.lineTo(h + 1, h + 1);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.fill();
+
+    // Spike body
+    ctx.beginPath();
+    ctx.moveTo(0, -h);
+    ctx.lineTo(-h, h);
+    ctx.lineTo(h, h);
+    ctx.closePath();
+    ctx.fillStyle = rgb(sc);
+    ctx.fill();
+    ctx.strokeStyle = rgb(lc);
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.restore();
+}
+
+function drawDeco(d) {
+    if (d.id === 1715) {
+        const [sx, sy] = w2s(d.x, d.y);
+        const dc = d.c ? col(d.c) : col(1002);
+        ctx.strokeStyle = rgba(dc, 0.4);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(sx - PX / 2, sy);
+        ctx.lineTo(sx + PX / 2, sy);
+        ctx.stroke();
+    }
+}
+
+function drawPlayer() {
+    const [sx, sy] = w2s(player.x, player.y);
+    const sz = BLOCK * SCALE;
+    const h = sz / 2;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(rot * Math.PI / 180);
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(-h + 3, -h + 3, sz, sz);
+
+    // Body
+    ctx.fillStyle = '#7dff00';
+    ctx.fillRect(-h, -h, sz, sz);
+
+    // Outline
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(-h, -h, sz, sz);
+
+    // Icon: simple cube face (default icon 0)
+    ctx.fillStyle = '#fff';
+    const ew = sz * 0.14, eh = sz * 0.18;
+    // Left eye
+    ctx.fillRect(-h + sz * 0.22, -h + sz * 0.22, ew, eh);
+    // Right eye
+    ctx.fillRect(-h + sz * 0.64, -h + sz * 0.22, ew, eh);
+    // Inner color accent
+    ctx.fillStyle = '#4ab300';
+    ctx.fillRect(-h + sz * 0.15, -h + sz * 0.55, sz * 0.7, sz * 0.12);
+
+    ctx.restore();
+}
+
+function drawParticles() {
+    for (const p of particles) {
         if (p.life <= 0) continue;
-        const [sx, sy] = worldToScreen(p.x, p.y);
+        const [sx, sy] = w2s(p.x, p.y);
         ctx.globalAlpha = p.life;
         ctx.fillStyle = '#7dff00';
-        ctx.fillRect(sx - p.size / 2, sy - p.size / 2, p.size, p.size);
+        const s = p.sz * p.life;
+        ctx.fillRect(sx - s / 2, sy - s / 2, s, s);
     }
     ctx.globalAlpha = 1;
 }
 
-// ===== GAME LOOP =====
-let lastTime = 0;
+// --- GAME LOOP ---
+let prevT = 0;
 
-function gameLoop(timestamp) {
-    const dt = Math.min((timestamp - lastTime) / 1000, 1 / 30); // cap at ~30fps minimum
-    lastTime = timestamp;
+function loop(ts) {
+    const rawDt = (ts - prevT) / 1000;
+    prevT = ts;
 
-    if (gameState === 'playing') {
-        updatePlayer(dt);
-        processColorTriggers();
+    // Clamp frame delta to avoid spiral of death
+    const frameDt = Math.min(rawDt, 1 / 20);
+
+    if (state === 'playing') {
+        // Fixed-step physics
+        accumulator += frameDt;
+        while (accumulator >= PHYSICS_STEP) {
+            physicsStep();
+            accumulator -= PHYSICS_STEP;
+            if (state !== 'playing') break;
+        }
+        updateColors(frameDt);
         updateCamera();
-    } else if (gameState === 'dead') {
-        deathTimer += dt;
-        // Update particles
-        for (const p of deathParticles) {
-            p.x += p.vx * dt;
-            p.y += p.vy * dt;
-            p.vy -= 500 * dt;
-            p.life -= dt * 1.5;
+        inputTap = false;
+    } else if (state === 'dead') {
+        deathT += frameDt;
+        for (const p of particles) {
+            p.x += p.vx * frameDt;
+            p.y += p.vy * frameDt;
+            p.vy -= 600 * frameDt;
+            p.life -= frameDt * 2;
         }
-        // Auto restart after delay
-        if (deathTimer > 1.5) {
-            restart();
-        }
-    } else if (gameState === 'complete') {
-        // Show completion
+        if (deathT > 1.0) restart();
     }
 
     render();
 
-    // Complete screen
-    if (gameState === 'complete') {
-        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    // Completion overlay
+    if (state === 'complete') {
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.fillStyle = '#fff';
-        ctx.font = 'bold 48px Segoe UI, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('Level Complete!', canvas.width / 2, canvas.height / 2 - 30);
-        ctx.font = '24px Segoe UI, sans-serif';
-        ctx.fillText(`Attempts: ${attempt}`, canvas.width / 2, canvas.height / 2 + 20);
+        ctx.font = 'bold 44px sans-serif';
+        ctx.fillText('Level Complete!', canvas.width / 2, canvas.height / 2 - 20);
+        ctx.font = '22px sans-serif';
+        ctx.fillText(`Attempts: ${attempt}`, canvas.width / 2, canvas.height / 2 + 25);
     }
 
-    requestAnimationFrame(gameLoop);
+    requestAnimationFrame(loop);
 }
 
-// ===== START =====
+// --- BOOT ---
 loadLevel().then(() => {
-    camera.y = 150;
-    requestAnimationFrame(gameLoop);
+    prevT = performance.now();
+    requestAnimationFrame(loop);
 }).catch(err => {
-    document.getElementById('loading').textContent = 'Error loading level: ' + err.message;
+    loadingScreen.innerHTML = `<div style="color:#f66">Failed to load: ${err.message}</div>`;
     console.error(err);
 });
-
 </script>
 </body>
 </html>
