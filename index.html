@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Every Single End 2 - GD Web Port</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #000; overflow: hidden;
+    display: flex; justify-content: center; align-items: center;
+    height: 100vh; font-family: 'Pusab', 'Segoe UI', 'Arial Black', sans-serif;
+    user-select: none; -webkit-user-select: none;
+}
+canvas { display: block; cursor: pointer; }
+#progress-container {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    width: 260px; height: 8px; background: rgba(0,0,0,0.4);
+    border-radius: 4px; border: 1px solid rgba(255,255,255,0.2);
+    z-index: 10;
+}
+#progress-fill {
+    height: 100%; width: 0%; border-radius: 4px;
+    background: linear-gradient(90deg, #00ff00, #7dff00);
+    transition: width 0.15s linear;
+}
+#attempt-text {
+    position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.6); font-size: 11px; z-index: 10;
+    letter-spacing: 1px;
+}
+#loading-screen {
+    position: absolute; inset: 0;
+    display: flex; justify-content: center; align-items: center;
+    background: #0a0a2e; color: #fff; font-size: 22px; z-index: 100;
+    flex-direction: column; gap: 12px;
+}
+#loading-screen .spinner {
+    width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.2);
+    border-top-color: #7dff00; border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="progress-container"><div id="progress-fill"></div></div>
+<div id="attempt-text">Attempt 1</div>
+<div id="loading-screen"><div class="spinner"></div><div>Loading level...</div></div>
+
+<script>
+'use strict';
+
+// =========================================================================
+// GEOMETRY DASH WEB PORT - Cube Mode Engine
+// =========================================================================
+
+// --- CONSTANTS (from GD reverse-engineering) ---
+const BLOCK = 30;           // 1 block = 30 GD units
+const SCALE = 2;            // render pixels per GD unit
+const PX = BLOCK * SCALE;   // 60px per block
+
+// Physics at 60fps reference (converted to per-second for delta-time)
+// GD decompiled values: jumpAccel ≈ 11.18 u/frame, gravity ≈ 0.958 u/frame²
+const SPEED_1X  = 251.16;     // horizontal speed (units/sec) from GDDocs
+const JUMP_VEL  = 11.18 * 60; // ≈ 670.8 u/s
+const GRAV      = 0.958 * 3600; // ≈ 3448.8 u/s²
+const GROUND_Y  = 0;
+
+// Hitbox tuning (GD dual-box system, neither rotates)
+//
+// HURTBOX (full icon size): Soft collision. Can slightly penetrate blocks but
+//   snaps to floors/ceilings. Also collides with spikes.
+// HITBOX (small inner square): DEATH box. If this touches a block side or a
+//   spike, you die instantly. Small = very forgiving ("how did I NOT die?!")
+//
+const P_HURTBOX = BLOCK;            // full 30 units, axis-aligned, never rotates
+const P_HITBOX  = BLOCK * 0.36;     // ~11 units, small inner death box
+// Spike inner hitbox: small zone near tip
+const S_HITBOX  = BLOCK * 0.28;
+
+// Camera
+const CAM_OFFSET_X = 160;   // units ahead of player
+const CAM_LERP_Y   = 0.08;  // vertical smoothing
+
+// Fixed physics step for consistency
+const PHYSICS_STEP = 1 / 240;
+let accumulator = 0;
+
+// --- DOM ---
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const progressFill = document.getElementById('progress-fill');
+const attemptText = document.getElementById('attempt-text');
+const loadingScreen = document.getElementById('loading-screen');
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// --- GAME STATE ---
+let level = null;
+let grid = {};         // spatial hash
+const CHUNK = 300;     // chunk width in GD units
+
+let player, cam, rot, state, deathT, attempt, particles;
+let colorNow = {};     // active color channels {id: {r,g,b,a,blend}}
+let colorAnims = [];   // running color animations
+let trigIdx = 0;        // next color trigger to check
+let inputHeld = false;
+let inputTap = false;
+let showHitboxes = false;  // toggle with 'H' key
+
+// Audio
+let music = null;
+let musicStarted = false;
+
+// --- INPUT ---
+function isGameKey(e) {
+    return e.code === 'Space' || e.code === 'ArrowUp' || e.key === 'w' || e.key === 'W';
+}
+function onPress(e) {
+    // Toggle hitbox debug with H
+    if (e.type === 'keydown' && (e.key === 'h' || e.key === 'H') && !e.repeat) {
+        showHitboxes = !showHitboxes;
+        return;
+    }
+    if (e.type === 'keydown' && !isGameKey(e)) return;
+    if (e.type === 'keydown' && e.repeat) return;
+    e.preventDefault();
+    inputHeld = true;
+    inputTap = true;
+    // Start music on first interaction (browser autoplay policy)
+    if (!musicStarted && music) {
+        music.currentTime = 0;
+        music.play().catch(() => {});
+        musicStarted = true;
+    }
+    if (state === 'dead') return;
+}
+function onRelease(e) {
+    if (e.type === 'keyup' && !isGameKey(e)) return;
+    inputHeld = false;
+}
+document.addEventListener('keydown', onPress);
+document.addEventListener('keyup', onRelease);
+canvas.addEventListener('mousedown', onPress);
+canvas.addEventListener('mouseup', onRelease);
+canvas.addEventListener('touchstart', onPress, { passive: false });
+canvas.addEventListener('touchend', onRelease);
+canvas.addEventListener('touchcancel', onRelease);
+
+// --- SPATIAL HASH ---
+function chunkOf(x) { return Math.floor(x / CHUNK); }
+
+function insertGrid(obj, type) {
+    const k = chunkOf(obj.x);
+    if (!grid[k]) grid[k] = { blocks: [], spikes: [], decos: [] };
+    grid[k][type].push(obj);
+}
+
+function queryGrid(px, radius, type) {
+    const out = [];
+    const c0 = chunkOf(px - radius), c1 = chunkOf(px + radius);
+    for (let c = c0; c <= c1; c++) {
+        const chunk = grid[c];
+        if (chunk && chunk[type]) out.push(...chunk[type]);
+    }
+    return out;
+}
+
+// --- LOAD LEVEL ---
+async function loadLevel() {
+    const r = await fetch('level.json');
+    level = await r.json();
+
+    grid = {};
+    for (const b of level.blocks)      insertGrid(b, 'blocks');
+    for (const s of level.spikes)      insertGrid(s, 'spikes');
+    for (const d of level.decorations) insertGrid(d, 'decos');
+
+    // init color channels
+    colorNow = {};
+    for (const [id, c] of Object.entries(level.colors)) {
+        colorNow[id] = { r: c.r, g: c.g, b: c.b, a: c.opacity ?? 1, blend: c.blending ?? 0 };
+    }
+
+    loadingScreen.style.display = 'none';
+    attempt = 1;
+    restart();
+}
+
+// --- RESTART ---
+function restart() {
+    player = { x: 0, y: BLOCK / 2 + GROUND_Y, vy: 0, grounded: false, dead: false };
+    cam = { x: CAM_OFFSET_X, y: 150 };
+    rot = 0;
+    state = 'playing';
+    deathT = 0;
+    particles = [];
+    trigIdx = 0;
+    colorAnims = [];
+    inputTap = false;
+
+    // Reset colors
+    colorNow = {};
+    for (const [id, c] of Object.entries(level.colors)) {
+        colorNow[id] = { r: c.r, g: c.g, b: c.b, a: c.opacity ?? 1, blend: c.blending ?? 0 };
+    }
+
+    // Restart music from beginning
+    if (music && musicStarted) {
+        music.currentTime = 0;
+        music.play().catch(() => {});
+    }
+
+    attemptText.textContent = `Attempt ${attempt}`;
+}
+
+// --- PHYSICS ---
+function physicsStep() {
+    if (player.dead) return;
+    const dt = PHYSICS_STEP;
+
+    // Move right
+    player.x += SPEED_1X * dt;
+
+    // Gravity + vertical movement
+    player.vy -= GRAV * dt;
+    player.y += player.vy * dt;
+
+    // Visual rotation
+    if (!player.grounded) {
+        rot -= 6.5 * dt * 60; // ~390 deg/s
+    } else {
+        rot = Math.round(rot / 90) * 90;
+    }
+
+    player.grounded = false;
+
+    // Ground
+    if (player.y - BLOCK / 2 < GROUND_Y) {
+        player.y = GROUND_Y + BLOCK / 2;
+        player.vy = 0;
+        player.grounded = true;
+    }
+
+    // Block collisions
+    const near = queryGrid(player.x, BLOCK * 2, 'blocks');
+    for (const b of near) {
+        collideBlock(b);
+        if (player.dead) return;
+    }
+
+    // Spike collisions
+    const spikes = queryGrid(player.x, BLOCK * 2, 'spikes');
+    for (const s of spikes) {
+        if (collideSpike(s)) { die(); return; }
+    }
+
+    // Jump: in GD cube, holding = jump immediately when grounded
+    if (inputHeld && player.grounded) {
+        player.vy = JUMP_VEL;
+        player.grounded = false;
+    } else if (inputTap && player.grounded) {
+        player.vy = JUMP_VEL;
+        player.grounded = false;
+        inputTap = false;
+    }
+
+    // Fall out of bounds
+    if (player.y < GROUND_Y - BLOCK * 5) die();
+
+    // Level complete
+    if (player.x > level.maxX + 200) state = 'complete';
+}
+
+function collideBlock(b) {
+    const half_b = BLOCK / 2;
+
+    // --- HURTBOX check (full icon): soft collision, snaps to surfaces ---
+    const half_hurt = P_HURTBOX / 2;
+    const dx = player.x - b.x;
+    const dy = player.y - b.y;
+    const hurtOX = half_hurt + half_b - Math.abs(dx);
+    const hurtOY = half_hurt + half_b - Math.abs(dy);
+
+    if (hurtOX <= 0 || hurtOY <= 0) return; // no overlap at all
+
+    // Hurtbox overlaps this block. Resolve softly (snap to floor/ceiling).
+    if (hurtOY < hurtOX) {
+        if (dy > 0) {
+            // Landing on top - snap up
+            player.y = b.y + half_b + BLOCK / 2;
+            if (player.vy < 0) player.vy = 0;
+            player.grounded = true;
+        } else {
+            // Hit ceiling - push down
+            player.y = b.y - half_b - BLOCK / 2;
+            if (player.vy > 0) player.vy = 0;
+        }
+    }
+
+    // --- HITBOX check (small inner box): if this overlaps a block, DIE ---
+    const half_hit = P_HITBOX / 2;
+    const dx2 = player.x - b.x;
+    const dy2 = player.y - b.y;
+    const hitOX = half_hit + half_b - Math.abs(dx2);
+    const hitOY = half_hit + half_b - Math.abs(dy2);
+
+    if (hitOX <= 0 || hitOY <= 0) return; // inner box doesn't touch
+
+    // Inner hitbox overlaps block. If it's a side collision, die.
+    // Vertical overlaps were already resolved by hurtbox snap above,
+    // so if the hitbox STILL overlaps horizontally, it's a wall = death.
+    if (hitOX < hitOY && dx2 >= 0) {
+        die();
+    }
+}
+
+function collideSpike(s) {
+    // GD spike collision: both hurtbox and hitbox interact with spikes.
+    // The spike has a small inner hitbox near its tip.
+    // Player HITBOX (small) touching spike hitbox = death.
+    // This makes spikes very lenient: "how did I NOT die there?!"
+
+    const dx = player.x - s.x;
+    const dy = player.y - s.y;
+
+    // Quick reject
+    const reach = BLOCK;
+    if (Math.abs(dx) > reach || Math.abs(dy) > reach) return false;
+
+    // Spike's inner danger zone is shifted toward the tip
+    const r = (((s.r || 0) % 360) + 360) % 360;
+    const tipShift = BLOCK * 0.18;
+    let sx = s.x, sy = s.y;
+    if (r === 0)   sy += tipShift;  // up
+    if (r === 90)  sx += tipShift;  // right
+    if (r === 180) sy -= tipShift;  // down
+    if (r === 270) sx -= tipShift;  // left
+
+    // Check player's small HITBOX against spike's small inner hitbox
+    const pHalf = P_HITBOX / 2;
+    const sHalf = S_HITBOX / 2;
+    const overlapX = (pHalf + sHalf) - Math.abs(player.x - sx);
+    const overlapY = (pHalf + sHalf) - Math.abs(player.y - sy);
+
+    return overlapX > 0 && overlapY > 0;
+}
+
+function die() {
+    if (player.dead) return;
+    player.dead = true;
+    state = 'dead';
+    deathT = 0;
+    attempt++;
+
+    // Stop music on death
+    if (music) music.pause();
+
+    // Burst particles
+    particles = [];
+    for (let i = 0; i < 24; i++) {
+        const a = (Math.PI * 2 * i) / 24 + Math.random() * 0.3;
+        const spd = 80 + Math.random() * 250;
+        particles.push({
+            x: player.x, y: player.y,
+            vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+            sz: 2 + Math.random() * 5, life: 1,
+        });
+    }
+}
+
+// --- COLOR TRIGGERS ---
+function updateColors(dt) {
+    // Activate new triggers
+    const triggers = level.colorTriggers;
+    while (trigIdx < triggers.length && player.x >= triggers[trigIdx].x) {
+        const t = triggers[trigIdx];
+        const ch = String(t.ch);
+        if (!colorNow[ch]) colorNow[ch] = { r: 255, g: 255, b: 255, a: 1, blend: 0 };
+
+        if (t.duration <= 0) {
+            // Instant
+            colorNow[ch].r = t.r;
+            colorNow[ch].g = t.g;
+            colorNow[ch].b = t.b;
+            colorNow[ch].blend = t.blending ?? 0;
+            if (t.opacity !== undefined) colorNow[ch].a = t.opacity;
+        } else {
+            // Animated
+            colorAnims.push({
+                ch, elapsed: 0, dur: t.duration,
+                fromR: colorNow[ch].r, fromG: colorNow[ch].g, fromB: colorNow[ch].b,
+                toR: t.r, toG: t.g, toB: t.b,
+                blend: t.blending ?? colorNow[ch].blend,
+            });
+        }
+        trigIdx++;
+    }
+
+    // Animate running color transitions
+    for (let i = colorAnims.length - 1; i >= 0; i--) {
+        const a = colorAnims[i];
+        a.elapsed += dt;
+        const t = Math.min(a.elapsed / a.dur, 1);
+        const col = colorNow[a.ch];
+        if (col) {
+            col.r = Math.round(a.fromR + (a.toR - a.fromR) * t);
+            col.g = Math.round(a.fromG + (a.toG - a.fromG) * t);
+            col.b = Math.round(a.fromB + (a.toB - a.fromB) * t);
+            col.blend = a.blend;
+        }
+        if (t >= 1) colorAnims.splice(i, 1);
+    }
+}
+
+// --- CAMERA ---
+function updateCamera() {
+    cam.x = player.x + CAM_OFFSET_X;
+
+    // Y: follow player with smooth tracking, keep ground visible
+    const halfH = (canvas.height / SCALE) / 2;
+    const minY = halfH - BLOCK;
+    const target = Math.max(player.y + BLOCK * 2, minY);
+    cam.y += (target - cam.y) * CAM_LERP_Y;
+}
+
+// --- RENDERING ---
+function w2s(wx, wy) {
+    return [
+        (wx - cam.x) * SCALE + canvas.width / 2,
+        canvas.height / 2 - (wy - cam.y) * SCALE
+    ];
+}
+
+function col(chId) {
+    const c = colorNow[String(chId)];
+    return c ? c : { r: 255, g: 255, b: 255, a: 1, blend: 0 };
+}
+function rgb(c) { return `rgb(${c.r},${c.g},${c.b})`; }
+function rgba(c, a) { return `rgba(${c.r},${c.g},${c.b},${a})`; }
+
+function render() {
+    const W = canvas.width, H = canvas.height;
+
+    // Background gradient
+    const bg = col(1000);
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, `rgb(${Math.max(0,bg.r-30)},${Math.max(0,bg.g-30)},${Math.max(0,bg.b-30)})`);
+    bgGrad.addColorStop(1, rgb(bg));
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Visible range
+    const vl = cam.x - W / SCALE / 2 - BLOCK * 2;
+    const vr = cam.x + W / SCALE / 2 + BLOCK * 2;
+    const vb = cam.y - H / SCALE / 2 - BLOCK * 2;
+    const vt = cam.y + H / SCALE / 2 + BLOCK * 2;
+
+    // Ground
+    drawGround();
+
+    // Objects by chunk
+    const c0 = chunkOf(vl), c1 = chunkOf(vr);
+    for (let c = c0; c <= c1; c++) {
+        const ch = grid[c];
+        if (!ch) continue;
+
+        // Decorations (behind blocks)
+        for (const d of ch.decos) {
+            if (d.x < vl || d.x > vr) continue;
+            drawDeco(d);
+        }
+        // Blocks
+        for (const b of ch.blocks) {
+            if (b.x < vl || b.x > vr || b.y < vb || b.y > vt) continue;
+            drawBlock(b);
+        }
+        // Spikes
+        for (const s of ch.spikes) {
+            if (s.x < vl || s.x > vr || s.y < vb || s.y > vt) continue;
+            drawSpike(s);
+        }
+    }
+
+    // Player
+    if (!player.dead) drawPlayer();
+
+    // Hitbox debug overlay
+    if (showHitboxes && !player.dead) drawHitboxes(c0, c1);
+
+    // Death particles
+    drawParticles();
+
+    // Progress
+    const pct = Math.max(0, Math.min(100, (player.x / level.maxX) * 100));
+    progressFill.style.width = pct + '%';
+}
+
+function drawGround() {
+    const gc = col(1001);
+    const lc = col(1002);
+    const [, gy] = w2s(0, GROUND_Y);
+
+    // Ground body
+    const gGrad = ctx.createLinearGradient(0, gy, 0, gy + 200);
+    gGrad.addColorStop(0, rgb(gc));
+    gGrad.addColorStop(1, `rgb(${Math.max(0,gc.r-40)},${Math.max(0,gc.g-40)},${Math.max(0,gc.b-40)})`);
+    ctx.fillStyle = gGrad;
+    ctx.fillRect(0, gy, canvas.width, canvas.height);
+
+    // Ground line (white)
+    ctx.strokeStyle = rgb(lc);
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(0, gy);
+    ctx.lineTo(canvas.width, gy);
+    ctx.stroke();
+}
+
+function drawBlock(b) {
+    const [sx, sy] = w2s(b.x, b.y);
+    const sz = BLOCK * SCALE;
+    const h = sz / 2;
+
+    const bc = b.c ? col(b.c) : col(1005);
+    const lc = col(1002);
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    if (b.r) ctx.rotate(-b.r * Math.PI / 180);
+
+    // 3D shadow effect (GD style: darker bottom-right)
+    ctx.fillStyle = `rgba(0,0,0,0.18)`;
+    ctx.fillRect(-h + 2, -h + 2, sz, sz);
+
+    // Block body
+    ctx.fillStyle = rgb(bc);
+    ctx.fillRect(-h, -h, sz, sz);
+
+    // Outline
+    ctx.strokeStyle = rgb(lc);
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(-h, -h, sz, sz);
+
+    // Inner detail per block type
+    drawBlockInner(b.id, h, sz, lc);
+
+    ctx.restore();
+}
+
+function drawBlockInner(id, h, sz, lc) {
+    const a = 0.25;
+    ctx.strokeStyle = rgba(lc, a);
+    ctx.fillStyle = rgba(lc, a);
+    ctx.lineWidth = 1;
+
+    switch (id) {
+        case 2: // diagonal
+            ctx.beginPath();
+            ctx.moveTo(-h, h); ctx.lineTo(h, -h);
+            ctx.stroke();
+            break;
+        case 3: // X
+            ctx.beginPath();
+            ctx.moveTo(-h, h); ctx.lineTo(h, -h);
+            ctx.moveTo(-h, -h); ctx.lineTo(h, h);
+            ctx.stroke();
+            break;
+        case 4: // border highlight
+            ctx.strokeRect(-h + 5, -h + 5, sz - 10, sz - 10);
+            break;
+        case 5: // inner square
+            ctx.strokeStyle = rgba(lc, 0.15);
+            ctx.strokeRect(-h + 6, -h + 6, sz - 12, sz - 12);
+            break;
+        case 6: // brick
+            ctx.beginPath();
+            ctx.moveTo(-h, 0); ctx.lineTo(h, 0);
+            ctx.moveTo(0, -h); ctx.lineTo(0, 0);
+            ctx.moveTo(h * 0.5, 0); ctx.lineTo(h * 0.5, h);
+            ctx.stroke();
+            break;
+        case 7: // half line
+            ctx.beginPath();
+            ctx.moveTo(-h, 0); ctx.lineTo(h, 0);
+            ctx.stroke();
+            break;
+    }
+}
+
+function drawSpike(s) {
+    const [sx, sy] = w2s(s.x, s.y);
+    const sz = BLOCK * SCALE;
+    const h = sz / 2;
+
+    const sc = s.c ? col(s.c) : col(1005);
+    const lc = col(1002);
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    if (s.r) ctx.rotate(-s.r * Math.PI / 180);
+
+    // Shadow
+    ctx.beginPath();
+    ctx.moveTo(1, -h + 3);
+    ctx.lineTo(-h + 1, h + 1);
+    ctx.lineTo(h + 1, h + 1);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.fill();
+
+    // Spike body
+    ctx.beginPath();
+    ctx.moveTo(0, -h);
+    ctx.lineTo(-h, h);
+    ctx.lineTo(h, h);
+    ctx.closePath();
+    ctx.fillStyle = rgb(sc);
+    ctx.fill();
+    ctx.strokeStyle = rgb(lc);
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.restore();
+}
+
+function drawDeco(d) {
+    if (d.id === 1715) {
+        const [sx, sy] = w2s(d.x, d.y);
+        const dc = d.c ? col(d.c) : col(1002);
+        ctx.strokeStyle = rgba(dc, 0.4);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(sx - PX / 2, sy);
+        ctx.lineTo(sx + PX / 2, sy);
+        ctx.stroke();
+    }
+}
+
+function drawPlayer() {
+    const [sx, sy] = w2s(player.x, player.y);
+    const sz = BLOCK * SCALE;
+    const h = sz / 2;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(rot * Math.PI / 180);
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(-h + 3, -h + 3, sz, sz);
+
+    // Body
+    ctx.fillStyle = '#7dff00';
+    ctx.fillRect(-h, -h, sz, sz);
+
+    // Outline
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(-h, -h, sz, sz);
+
+    // Icon: simple cube face (default icon 0)
+    ctx.fillStyle = '#fff';
+    const ew = sz * 0.14, eh = sz * 0.18;
+    // Left eye
+    ctx.fillRect(-h + sz * 0.22, -h + sz * 0.22, ew, eh);
+    // Right eye
+    ctx.fillRect(-h + sz * 0.64, -h + sz * 0.22, ew, eh);
+    // Inner color accent
+    ctx.fillStyle = '#4ab300';
+    ctx.fillRect(-h + sz * 0.15, -h + sz * 0.55, sz * 0.7, sz * 0.12);
+
+    ctx.restore();
+}
+
+function drawHitboxes(c0, c1) {
+    const [px, py] = w2s(player.x, player.y);
+
+    // Player HURTBOX (green) - full icon, soft collision, never rotates
+    const hurtPx = P_HURTBOX * SCALE;
+    ctx.strokeStyle = 'rgba(0,255,0,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(px - hurtPx / 2, py - hurtPx / 2, hurtPx, hurtPx);
+
+    // Player HITBOX (red) - small inner death box, never rotates
+    const hitPx = P_HITBOX * SCALE;
+    ctx.fillStyle = 'rgba(255,0,0,0.25)';
+    ctx.fillRect(px - hitPx / 2, py - hitPx / 2, hitPx, hitPx);
+    ctx.strokeStyle = 'rgba(255,0,0,0.9)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px - hitPx / 2, py - hitPx / 2, hitPx, hitPx);
+
+    for (let c = c0; c <= c1; c++) {
+        const ch = grid[c];
+        if (!ch) continue;
+
+        // Spike inner hitboxes (red, shifted toward tip)
+        for (const s of ch.spikes) {
+            const r = (((s.r || 0) % 360) + 360) % 360;
+            const tipShift = BLOCK * 0.18;
+            let sx = s.x, sy = s.y;
+            if (r === 0)   sy += tipShift;
+            if (r === 90)  sx += tipShift;
+            if (r === 180) sy -= tipShift;
+            if (r === 270) sx -= tipShift;
+
+            const [ssx, ssy] = w2s(sx, sy);
+            const sPx = S_HITBOX * SCALE;
+            ctx.strokeStyle = 'rgba(255,80,80,0.6)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(ssx - sPx / 2, ssy - sPx / 2, sPx, sPx);
+        }
+        // Block hitboxes (blue outline)
+        for (const b of ch.blocks) {
+            const [bx, by] = w2s(b.x, b.y);
+            const bPx = BLOCK * SCALE;
+            ctx.strokeStyle = 'rgba(0,100,255,0.3)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(bx - bPx / 2, by - bPx / 2, bPx, bPx);
+        }
+    }
+}
+
+function drawParticles() {
+    for (const p of particles) {
+        if (p.life <= 0) continue;
+        const [sx, sy] = w2s(p.x, p.y);
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = '#7dff00';
+        const s = p.sz * p.life;
+        ctx.fillRect(sx - s / 2, sy - s / 2, s, s);
+    }
+    ctx.globalAlpha = 1;
+}
+
+// --- GAME LOOP ---
+let prevT = 0;
+
+function loop(ts) {
+    const rawDt = (ts - prevT) / 1000;
+    prevT = ts;
+
+    // Clamp frame delta to avoid spiral of death
+    const frameDt = Math.min(rawDt, 1 / 20);
+
+    if (state === 'playing') {
+        // Fixed-step physics
+        accumulator += frameDt;
+        while (accumulator >= PHYSICS_STEP) {
+            physicsStep();
+            accumulator -= PHYSICS_STEP;
+            if (state !== 'playing') break;
+        }
+        updateColors(frameDt);
+        updateCamera();
+        inputTap = false;
+    } else if (state === 'dead') {
+        deathT += frameDt;
+        for (const p of particles) {
+            p.x += p.vx * frameDt;
+            p.y += p.vy * frameDt;
+            p.vy -= 600 * frameDt;
+            p.life -= frameDt * 2;
+        }
+        if (deathT > 1.0) restart();
+    }
+
+    render();
+
+    // Completion overlay
+    if (state === 'complete') {
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 44px sans-serif';
+        ctx.fillText('Level Complete!', canvas.width / 2, canvas.height / 2 - 20);
+        ctx.font = '22px sans-serif';
+        ctx.fillText(`Attempts: ${attempt}`, canvas.width / 2, canvas.height / 2 + 25);
+    }
+
+    requestAnimationFrame(loop);
+}
+
+// --- BOOT ---
+// Load music
+music = new Audio('song.mp3');
+music.volume = 0.5;
+music.preload = 'auto';
+
+loadLevel().then(() => {
+    prevT = performance.now();
+    requestAnimationFrame(loop);
+}).catch(err => {
+    loadingScreen.innerHTML = `<div style="color:#f66">Failed to load: ${err.message}</div>`;
+    console.error(err);
+});
+</script>
+</body>
+</html>
