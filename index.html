@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Every Single End 2 - GD Web Port</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; image-rendering: pixelated; }
+#ui-overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none; display: flex; flex-direction: column;
+}
+#progress-bar-container {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    width: 280px; height: 10px; background: rgba(0,0,0,0.5);
+    border-radius: 5px; border: 1px solid rgba(255,255,255,0.3);
+}
+#progress-bar {
+    height: 100%; width: 0%; background: #0f0; border-radius: 5px;
+    transition: width 0.1s linear;
+}
+#attempt-label {
+    position: absolute; top: 28px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.7); font-size: 12px;
+}
+#death-screen {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: none; justify-content: center; align-items: center;
+    pointer-events: auto; cursor: pointer;
+}
+#death-screen.show { display: flex; }
+#loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #fff; font-size: 24px;
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui-overlay">
+    <div id="progress-bar-container"><div id="progress-bar"></div></div>
+    <div id="attempt-label">Attempt 1</div>
+</div>
+<div id="death-screen"></div>
+<div id="loading">Loading level...</div>
+
+<script>
+'use strict';
+
+// ===== CONSTANTS =====
+const BLOCK_SIZE = 30;         // GD units per block
+const SCALE = 2.0;             // pixels per GD unit
+const PX = BLOCK_SIZE * SCALE; // pixels per block = 60
+
+// Physics (GD cube mode, tuned to feel authentic)
+const PLAYER_SPEED = 311.58;   // units/sec at 1x speed
+const GRAVITY = 2400;          // units/sec^2
+const JUMP_VELOCITY = 580;     // units/sec upward
+const GROUND_Y = 0;            // ground surface in GD units
+
+// Player
+const PLAYER_SIZE = BLOCK_SIZE;         // 30 units
+const PLAYER_HITBOX = BLOCK_SIZE * 0.85; // slightly smaller hitbox
+const SPIKE_HITBOX = BLOCK_SIZE * 0.45;  // spike inner hitbox
+
+// Camera
+const CAM_LEAD = 200; // units ahead of player
+
+// ===== CANVAS SETUP =====
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ===== GAME STATE =====
+let level = null;
+let spatialGrid = {};  // chunk-based spatial index
+const CHUNK_SIZE = 300; // 10 blocks per chunk
+
+let player = null;
+let camera = { x: 0, y: 0 };
+let input = { jump: false, jumpPressed: false };
+let attempt = 1;
+let gameState = 'loading'; // loading, playing, dead, complete
+let deathTimer = 0;
+let deathParticles = [];
+let activeColors = {};  // current color channel values
+let colorTriggerIndex = 0; // next color trigger to process
+let rotationAngle = 0; // player visual rotation
+
+// ===== INPUT =====
+function onDown(e) {
+    if (e.type === 'keydown' && e.code !== 'Space' && e.code !== 'ArrowUp' && e.key !== 'w') return;
+    e.preventDefault();
+    if (gameState === 'dead') { restart(); return; }
+    if (gameState === 'playing') {
+        input.jump = true;
+        input.jumpPressed = true;
+    }
+}
+function onUp(e) {
+    if (e.type === 'keyup' && e.code !== 'Space' && e.code !== 'ArrowUp' && e.key !== 'w') return;
+    input.jump = false;
+}
+
+document.addEventListener('keydown', onDown);
+document.addEventListener('keyup', onUp);
+canvas.addEventListener('mousedown', onDown);
+canvas.addEventListener('mouseup', onUp);
+canvas.addEventListener('touchstart', onDown, { passive: false });
+canvas.addEventListener('touchend', onUp);
+
+// ===== SPATIAL INDEXING =====
+function getChunkKey(x) {
+    return Math.floor(x / CHUNK_SIZE);
+}
+
+function buildSpatialGrid(objects, type) {
+    for (const obj of objects) {
+        const key = getChunkKey(obj.x);
+        if (!spatialGrid[key]) spatialGrid[key] = { blocks: [], spikes: [], decos: [] };
+        spatialGrid[key][type].push(obj);
+    }
+}
+
+function getObjectsNear(px, type) {
+    const results = [];
+    const chunk = getChunkKey(px);
+    for (let c = chunk - 1; c <= chunk + 1; c++) {
+        if (spatialGrid[c] && spatialGrid[c][type]) {
+            results.push(...spatialGrid[c][type]);
+        }
+    }
+    return results;
+}
+
+// ===== LEVEL LOADING =====
+async function loadLevel() {
+    const resp = await fetch('level.json');
+    level = await resp.json();
+
+    // Build spatial index
+    spatialGrid = {};
+    buildSpatialGrid(level.blocks, 'blocks');
+    buildSpatialGrid(level.spikes, 'spikes');
+    buildSpatialGrid(level.decorations, 'decos');
+
+    // Initialize colors
+    activeColors = {};
+    for (const [ch, col] of Object.entries(level.colors)) {
+        activeColors[ch] = { ...col };
+    }
+
+    document.getElementById('loading').style.display = 'none';
+    restart();
+}
+
+// ===== PLAYER =====
+function createPlayer() {
+    return {
+        x: -30,       // start slightly before the level
+        y: 105,        // above ground (will fall into position)
+        vy: 0,
+        onGround: false,
+        dead: false,
+        width: PLAYER_SIZE,
+        height: PLAYER_SIZE,
+    };
+}
+
+function restart() {
+    player = createPlayer();
+    rotationAngle = 0;
+    deathParticles = [];
+    gameState = 'playing';
+    colorTriggerIndex = 0;
+
+    // Reset colors
+    activeColors = {};
+    for (const [ch, col] of Object.entries(level.colors)) {
+        activeColors[ch] = { ...col };
+    }
+
+    document.getElementById('death-screen').classList.remove('show');
+    document.getElementById('attempt-label').textContent = `Attempt ${attempt}`;
+    input.jump = false;
+    input.jumpPressed = false;
+}
+
+// ===== PHYSICS =====
+function updatePlayer(dt) {
+    if (player.dead) return;
+
+    // Horizontal movement
+    player.x += PLAYER_SPEED * dt;
+
+    // Gravity
+    player.vy -= GRAVITY * dt;
+    player.y += player.vy * dt;
+
+    // Rotation (visual only)
+    if (!player.onGround) {
+        rotationAngle -= 400 * dt; // degrees per second
+    } else {
+        // Snap to nearest 90 degrees
+        rotationAngle = Math.round(rotationAngle / 90) * 90;
+    }
+
+    player.onGround = false;
+
+    // Ground collision
+    const halfH = PLAYER_SIZE / 2;
+    if (player.y - halfH < GROUND_Y) {
+        player.y = GROUND_Y + halfH;
+        player.vy = 0;
+        player.onGround = true;
+    }
+
+    // Block collisions
+    const nearBlocks = getObjectsNear(player.x, 'blocks');
+    for (const block of nearBlocks) {
+        resolveBlockCollision(block);
+    }
+
+    // Spike collisions
+    const nearSpikes = getObjectsNear(player.x, 'spikes');
+    for (const spike of nearSpikes) {
+        if (checkSpikeCollision(spike)) {
+            die();
+            return;
+        }
+    }
+
+    // Jump
+    if (input.jumpPressed && player.onGround) {
+        player.vy = JUMP_VELOCITY;
+        player.onGround = false;
+        input.jumpPressed = false;
+    }
+
+    // Ceiling death (out of bounds)
+    if (player.y < -BLOCK_SIZE * 2) {
+        die();
+    }
+
+    // Level complete
+    if (player.x > level.maxX + 300) {
+        gameState = 'complete';
+    }
+}
+
+function resolveBlockCollision(block) {
+    const bx = block.x, by = block.y;
+    const bs = BLOCK_SIZE;
+    const ph = PLAYER_HITBOX;
+
+    // AABB overlap check
+    const dx = player.x - bx;
+    const dy = player.y - by;
+    const overlapX = (ph / 2 + bs / 2) - Math.abs(dx);
+    const overlapY = (ph / 2 + bs / 2) - Math.abs(dy);
+
+    if (overlapX <= 0 || overlapY <= 0) return;
+
+    // Resolve collision on the axis with smallest overlap
+    if (overlapY < overlapX) {
+        if (dy > 0) {
+            // Landing on top
+            player.y = by + bs / 2 + PLAYER_SIZE / 2;
+            if (player.vy < 0) player.vy = 0;
+            player.onGround = true;
+        } else {
+            // Hitting from below
+            player.y = by - bs / 2 - PLAYER_SIZE / 2;
+            if (player.vy > 0) player.vy = 0;
+        }
+    } else {
+        if (dx > 0) {
+            // Hitting block from right side (player moving into it) = death in GD
+            die();
+        } else {
+            // Shouldn't happen in normal play
+            player.x = bx - bs / 2 - PLAYER_SIZE / 2;
+        }
+    }
+}
+
+function checkSpikeCollision(spike) {
+    const sx = spike.x, sy = spike.y;
+    const rot = spike.r || 0;
+    const ph = PLAYER_HITBOX;
+
+    // Simple distance-based check with inner hitbox
+    const dx = player.x - sx;
+    const dy = player.y - sy;
+
+    // Rectangular proximity check first
+    if (Math.abs(dx) > (ph / 2 + SPIKE_HITBOX / 2)) return false;
+    if (Math.abs(dy) > (ph / 2 + SPIKE_HITBOX / 2)) return false;
+
+    // Triangular hitbox approximation based on rotation
+    const normRot = ((rot % 360) + 360) % 360;
+    const tipX = sx + (normRot === 90 ? BLOCK_SIZE * 0.3 : normRot === 270 ? -BLOCK_SIZE * 0.3 : 0);
+    const tipY = sy + (normRot === 0 ? BLOCK_SIZE * 0.3 : normRot === 180 ? -BLOCK_SIZE * 0.3 : 0);
+
+    const distToTip = Math.sqrt((player.x - tipX) ** 2 + (player.y - tipY) ** 2);
+    return distToTip < (ph / 2 + SPIKE_HITBOX * 0.4);
+}
+
+function die() {
+    if (player.dead) return;
+    player.dead = true;
+    gameState = 'dead';
+    deathTimer = 0;
+    attempt++;
+
+    // Create death particles
+    deathParticles = [];
+    for (let i = 0; i < 20; i++) {
+        const angle = (Math.PI * 2 * i) / 20 + Math.random() * 0.3;
+        const speed = 100 + Math.random() * 200;
+        deathParticles.push({
+            x: player.x, y: player.y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            size: 3 + Math.random() * 6,
+            life: 1.0,
+        });
+    }
+}
+
+// ===== COLOR TRIGGERS =====
+function processColorTriggers() {
+    if (!level.colorTriggers) return;
+    while (colorTriggerIndex < level.colorTriggers.length) {
+        const ct = level.colorTriggers[colorTriggerIndex];
+        if (player.x >= ct.x) {
+            const ch = String(ct.ch);
+            if (!activeColors[ch]) {
+                activeColors[ch] = { r: 255, g: 255, b: 255, blending: 0, opacity: 1 };
+            }
+            // For now, apply instantly (duration=0 or snap)
+            activeColors[ch].r = ct.r;
+            activeColors[ch].g = ct.g;
+            activeColors[ch].b = ct.b;
+            if (ct.blending !== undefined) activeColors[ch].blending = ct.blending;
+            if (ct.opacity !== undefined) activeColors[ch].opacity = ct.opacity;
+            colorTriggerIndex++;
+        } else {
+            break;
+        }
+    }
+}
+
+// ===== RENDERING =====
+function getColor(channelId) {
+    const ch = String(channelId);
+    const col = activeColors[ch];
+    if (col) return `rgb(${col.r},${col.g},${col.b})`;
+    // Default channel colors
+    if (channelId === 0) return 'rgb(255,255,255)';
+    return 'rgb(255,255,255)';
+}
+
+function getColorObj(channelId) {
+    const ch = String(channelId);
+    return activeColors[ch] || { r: 255, g: 255, b: 255, blending: 0, opacity: 1 };
+}
+
+function updateCamera() {
+    const targetX = player.x + CAM_LEAD;
+    camera.x = targetX;
+
+    // Camera Y: follow player but keep ground visible
+    const screenUnitsH = (canvas.height / SCALE) / 2;
+    const minCamY = screenUnitsH - BLOCK_SIZE * 2; // show some ground
+    const targetY = Math.max(player.y, minCamY);
+    camera.y += (targetY - camera.y) * 0.1; // smooth follow
+}
+
+function worldToScreen(wx, wy) {
+    return [
+        (wx - camera.x) * SCALE + canvas.width / 2,
+        canvas.height / 2 - (wy - camera.y) * SCALE
+    ];
+}
+
+function render() {
+    const w = canvas.width, h = canvas.height;
+
+    // Background
+    const bgCol = getColorObj(1000);
+    ctx.fillStyle = `rgb(${bgCol.r},${bgCol.g},${bgCol.b})`;
+    ctx.fillRect(0, 0, w, h);
+
+    // Calculate visible range in world units
+    const viewLeft = camera.x - w / SCALE / 2 - BLOCK_SIZE;
+    const viewRight = camera.x + w / SCALE / 2 + BLOCK_SIZE;
+    const viewBottom = camera.y - h / SCALE / 2 - BLOCK_SIZE;
+    const viewTop = camera.y + h / SCALE / 2 + BLOCK_SIZE;
+
+    // Ground
+    renderGround(viewLeft, viewRight);
+
+    // Render decorations
+    renderDecorations(viewLeft, viewRight, viewBottom, viewTop);
+
+    // Render blocks
+    renderBlocks(viewLeft, viewRight, viewBottom, viewTop);
+
+    // Render spikes
+    renderSpikes(viewLeft, viewRight, viewBottom, viewTop);
+
+    // Render player
+    if (!player.dead) {
+        renderPlayer();
+    }
+
+    // Death particles
+    renderDeathParticles();
+
+    // Progress bar
+    const progress = Math.max(0, Math.min(1, player.x / level.maxX));
+    document.getElementById('progress-bar').style.width = (progress * 100) + '%';
+}
+
+function renderGround(viewLeft, viewRight) {
+    const gCol = getColorObj(1001);
+    const [, groundScreenY] = worldToScreen(0, GROUND_Y);
+
+    // Ground fill
+    ctx.fillStyle = `rgb(${gCol.r},${gCol.g},${gCol.b})`;
+    ctx.fillRect(0, groundScreenY, canvas.width, canvas.height - groundScreenY);
+
+    // Ground line
+    const lineCol = getColorObj(1002);
+    ctx.strokeStyle = `rgb(${lineCol.r},${lineCol.g},${lineCol.b})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, groundScreenY);
+    ctx.lineTo(canvas.width, groundScreenY);
+    ctx.stroke();
+}
+
+function renderBlocks(viewLeft, viewRight, viewBottom, viewTop) {
+    const chunkLeft = getChunkKey(viewLeft);
+    const chunkRight = getChunkKey(viewRight);
+
+    const objCol = getColorObj(1005);
+    const lineCol = getColorObj(1002);
+    const tdlCol = getColorObj(1004);
+
+    for (let c = chunkLeft; c <= chunkRight; c++) {
+        const chunk = spatialGrid[c];
+        if (!chunk || !chunk.blocks) continue;
+
+        for (const block of chunk.blocks) {
+            if (block.x < viewLeft || block.x > viewRight) continue;
+            if (block.y < viewBottom || block.y > viewTop) continue;
+
+            const [sx, sy] = worldToScreen(block.x, block.y);
+            const size = BLOCK_SIZE * SCALE;
+            const half = size / 2;
+
+            // Get object-specific color or default
+            const bCol = block.c ? getColorObj(block.c) : objCol;
+
+            ctx.save();
+            ctx.translate(sx, sy);
+            if (block.r) ctx.rotate(-block.r * Math.PI / 180);
+
+            // Block fill
+            ctx.fillStyle = `rgb(${bCol.r},${bCol.g},${bCol.b})`;
+            ctx.fillRect(-half, -half, size, size);
+
+            // Block outline
+            ctx.strokeStyle = `rgb(${lineCol.r},${lineCol.g},${lineCol.b})`;
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(-half, -half, size, size);
+
+            // Inner detail based on block type
+            renderBlockDetail(block.id, half, size, tdlCol);
+
+            ctx.restore();
+        }
+    }
+}
+
+function renderBlockDetail(id, half, size, tdlCol) {
+    ctx.strokeStyle = `rgba(${tdlCol.r},${tdlCol.g},${tdlCol.b},0.3)`;
+    ctx.lineWidth = 1;
+
+    switch (id) {
+        case 1: // Plain block - no detail
+            break;
+        case 2: // Diagonal line block
+            ctx.beginPath();
+            ctx.moveTo(-half, half);
+            ctx.lineTo(half, -half);
+            ctx.stroke();
+            break;
+        case 3: // X pattern
+            ctx.beginPath();
+            ctx.moveTo(-half, half);
+            ctx.lineTo(half, -half);
+            ctx.moveTo(-half, -half);
+            ctx.lineTo(half, half);
+            ctx.stroke();
+            break;
+        case 4: // Dot pattern
+            ctx.fillStyle = `rgba(${tdlCol.r},${tdlCol.g},${tdlCol.b},0.3)`;
+            const d = size / 4;
+            for (let dx = -1; dx <= 1; dx += 2) {
+                for (let dy = -1; dy <= 1; dy += 2) {
+                    ctx.beginPath();
+                    ctx.arc(dx * d * 0.6, dy * d * 0.6, 2, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+            break;
+        case 5: // Outline/breakable - inner rectangle
+            ctx.strokeRect(-half + 4, -half + 4, size - 8, size - 8);
+            break;
+        case 6: // Brick pattern
+            ctx.beginPath();
+            ctx.moveTo(-half, 0);
+            ctx.lineTo(half, 0);
+            ctx.moveTo(0, -half);
+            ctx.lineTo(0, 0);
+            ctx.moveTo(-half + size * 0.3, 0);
+            ctx.lineTo(-half + size * 0.3, half);
+            ctx.stroke();
+            break;
+        case 7: // Half block (same size but different visual)
+            ctx.beginPath();
+            ctx.moveTo(-half, 0);
+            ctx.lineTo(half, 0);
+            ctx.stroke();
+            break;
+    }
+}
+
+function renderSpikes(viewLeft, viewRight, viewBottom, viewTop) {
+    const chunkLeft = getChunkKey(viewLeft);
+    const chunkRight = getChunkKey(viewRight);
+
+    for (let c = chunkLeft; c <= chunkRight; c++) {
+        const chunk = spatialGrid[c];
+        if (!chunk || !chunk.spikes) continue;
+
+        for (const spike of chunk.spikes) {
+            if (spike.x < viewLeft || spike.x > viewRight) continue;
+            if (spike.y < viewBottom || spike.y > viewTop) continue;
+
+            const [sx, sy] = worldToScreen(spike.x, spike.y);
+            const size = BLOCK_SIZE * SCALE;
+            const half = size / 2;
+
+            const sCol = spike.c ? getColorObj(spike.c) : getColorObj(1005);
+            const lineCol = getColorObj(1002);
+
+            ctx.save();
+            ctx.translate(sx, sy);
+            if (spike.r) ctx.rotate(-spike.r * Math.PI / 180);
+
+            // Draw spike triangle (pointing up by default)
+            ctx.beginPath();
+            ctx.moveTo(0, -half);           // tip
+            ctx.lineTo(-half, half);        // bottom left
+            ctx.lineTo(half, half);         // bottom right
+            ctx.closePath();
+
+            ctx.fillStyle = `rgb(${sCol.r},${sCol.g},${sCol.b})`;
+            ctx.fill();
+            ctx.strokeStyle = `rgb(${lineCol.r},${lineCol.g},${lineCol.b})`;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            ctx.restore();
+        }
+    }
+}
+
+function renderDecorations(viewLeft, viewRight, viewBottom, viewTop) {
+    const chunkLeft = getChunkKey(viewLeft);
+    const chunkRight = getChunkKey(viewRight);
+
+    for (let c = chunkLeft; c <= chunkRight; c++) {
+        const chunk = spatialGrid[c];
+        if (!chunk || !chunk.decos) continue;
+
+        for (const deco of chunk.decos) {
+            if (deco.x < viewLeft || deco.x > viewRight) continue;
+
+            const [sx, sy] = worldToScreen(deco.x, deco.y);
+            const size = BLOCK_SIZE * SCALE;
+
+            if (deco.id === 1715) {
+                // Ground decoration line
+                const col = deco.c ? getColorObj(deco.c) : getColorObj(1002);
+                ctx.strokeStyle = `rgba(${col.r},${col.g},${col.b},0.5)`;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(sx - size / 2, sy);
+                ctx.lineTo(sx + size / 2, sy);
+                ctx.stroke();
+            }
+        }
+    }
+}
+
+function renderPlayer() {
+    const [sx, sy] = worldToScreen(player.x, player.y);
+    const size = PLAYER_SIZE * SCALE;
+    const half = size / 2;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(rotationAngle * Math.PI / 180);
+
+    // Player cube body
+    ctx.fillStyle = '#7dff00'; // GD green
+    ctx.fillRect(-half, -half, size, size);
+
+    // Outline
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-half, -half, size, size);
+
+    // Icon detail (simple face)
+    ctx.fillStyle = '#fff';
+    // Eyes
+    ctx.fillRect(-half + size * 0.25, -half + size * 0.2, size * 0.15, size * 0.2);
+    ctx.fillRect(-half + size * 0.6, -half + size * 0.2, size * 0.15, size * 0.2);
+
+    ctx.restore();
+}
+
+function renderDeathParticles() {
+    for (const p of deathParticles) {
+        if (p.life <= 0) continue;
+        const [sx, sy] = worldToScreen(p.x, p.y);
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = '#7dff00';
+        ctx.fillRect(sx - p.size / 2, sy - p.size / 2, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+}
+
+// ===== GAME LOOP =====
+let lastTime = 0;
+
+function gameLoop(timestamp) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 1 / 30); // cap at ~30fps minimum
+    lastTime = timestamp;
+
+    if (gameState === 'playing') {
+        updatePlayer(dt);
+        processColorTriggers();
+        updateCamera();
+    } else if (gameState === 'dead') {
+        deathTimer += dt;
+        // Update particles
+        for (const p of deathParticles) {
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+            p.vy -= 500 * dt;
+            p.life -= dt * 1.5;
+        }
+        // Auto restart after delay
+        if (deathTimer > 1.5) {
+            restart();
+        }
+    } else if (gameState === 'complete') {
+        // Show completion
+    }
+
+    render();
+
+    // Complete screen
+    if (gameState === 'complete') {
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 48px Segoe UI, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Level Complete!', canvas.width / 2, canvas.height / 2 - 30);
+        ctx.font = '24px Segoe UI, sans-serif';
+        ctx.fillText(`Attempts: ${attempt}`, canvas.width / 2, canvas.height / 2 + 20);
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+// ===== START =====
+loadLevel().then(() => {
+    camera.y = 150;
+    requestAnimationFrame(gameLoop);
+}).catch(err => {
+    document.getElementById('loading').textContent = 'Error loading level: ' + err.message;
+    console.error(err);
+});
+
+</script>
+</body>
+</html>
