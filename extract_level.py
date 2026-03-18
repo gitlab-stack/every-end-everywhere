@@ -123,6 +123,8 @@ def main():
             entry = {'id': obj_id, 'x': x, 'y': y}
             if rot: entry['r'] = rot
             if color_ch: entry['c'] = color_ch
+            if flip_x: entry['flipX'] = 1
+            if flip_y: entry['flipY'] = 1
             spikes.append(entry)
         elif obj_id == 899:
             ct = {

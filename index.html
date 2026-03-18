@@ -235,7 +235,7 @@ function physicsStep() {
 
     // Visual rotation
     if (!player.grounded) {
-        rot -= 6.5 * dt * 60; // ~390 deg/s
+        rot += 6.5 * dt * 60; // ~390 deg/s clockwise
     } else {
         rot = Math.round(rot / 90) * 90;
     }
@@ -515,9 +515,9 @@ function drawGround() {
     ctx.fillStyle = gGrad;
     ctx.fillRect(0, gy, canvas.width, canvas.height);
 
-    // Ground line (white)
-    ctx.strokeStyle = rgb(lc);
-    ctx.lineWidth = 2.5;
+    // Ground line
+    ctx.strokeStyle = rgba(lc, 0.5);
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(0, gy);
     ctx.lineTo(canvas.width, gy);
@@ -534,19 +534,23 @@ function drawBlock(b) {
 
     ctx.save();
     ctx.translate(sx, sy);
-    if (b.r) ctx.rotate(-b.r * Math.PI / 180);
-
-    // 3D shadow effect (GD style: darker bottom-right)
-    ctx.fillStyle = `rgba(0,0,0,0.18)`;
-    ctx.fillRect(-h + 2, -h + 2, sz, sz);
+    if (b.r) ctx.rotate(b.r * Math.PI / 180);
 
     // Block body
     ctx.fillStyle = rgb(bc);
     ctx.fillRect(-h, -h, sz, sz);
 
+    // Subtle 3D: lighter top-left edge, darker bottom-right
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    ctx.fillRect(-h, -h, sz, 2);
+    ctx.fillRect(-h, -h, 2, sz);
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.fillRect(-h, h - 2, sz, 2);
+    ctx.fillRect(h - 2, -h, 2, sz);
+
     // Outline
-    ctx.strokeStyle = rgb(lc);
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = rgba(lc, 0.6);
+    ctx.lineWidth = 1;
     ctx.strokeRect(-h, -h, sz, sz);
 
     // Inner detail per block type
@@ -605,16 +609,9 @@ function drawSpike(s) {
 
     ctx.save();
     ctx.translate(sx, sy);
-    if (s.r) ctx.rotate(-s.r * Math.PI / 180);
-
-    // Shadow
-    ctx.beginPath();
-    ctx.moveTo(1, -h + 3);
-    ctx.lineTo(-h + 1, h + 1);
-    ctx.lineTo(h + 1, h + 1);
-    ctx.closePath();
-    ctx.fillStyle = 'rgba(0,0,0,0.15)';
-    ctx.fill();
+    if (s.flipX) ctx.scale(-1, 1);
+    if (s.flipY) ctx.scale(1, -1);
+    if (s.r) ctx.rotate(s.r * Math.PI / 180);
 
     // Spike body
     ctx.beginPath();
@@ -624,8 +621,8 @@ function drawSpike(s) {
     ctx.closePath();
     ctx.fillStyle = rgb(sc);
     ctx.fill();
-    ctx.strokeStyle = rgb(lc);
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = rgba(lc, 0.5);
+    ctx.lineWidth = 1;
     ctx.stroke();
 
     ctx.restore();
@@ -651,31 +648,31 @@ function drawPlayer() {
 
     ctx.save();
     ctx.translate(sx, sy);
-    ctx.rotate(rot * Math.PI / 180);
+    ctx.rotate(-rot * Math.PI / 180);
 
     // Shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.3)';
-    ctx.fillRect(-h + 3, -h + 3, sz, sz);
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.fillRect(-h + 2, -h + 2, sz, sz);
 
-    // Body
-    ctx.fillStyle = '#7dff00';
+    // Body (GD default green)
+    ctx.fillStyle = '#40e020';
     ctx.fillRect(-h, -h, sz, sz);
 
+    // Inner color (secondary color, darker)
+    const inset = 4;
+    ctx.fillStyle = '#1a8a0a';
+    ctx.fillRect(-h + inset, -h + inset, sz - inset * 2, sz - inset * 2);
+
     // Outline
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 2;
     ctx.strokeRect(-h, -h, sz, sz);
 
-    // Icon: simple cube face (default icon 0)
-    ctx.fillStyle = '#fff';
-    const ew = sz * 0.14, eh = sz * 0.18;
-    // Left eye
-    ctx.fillRect(-h + sz * 0.22, -h + sz * 0.22, ew, eh);
-    // Right eye
-    ctx.fillRect(-h + sz * 0.64, -h + sz * 0.22, ew, eh);
-    // Inner color accent
-    ctx.fillStyle = '#4ab300';
-    ctx.fillRect(-h + sz * 0.15, -h + sz * 0.55, sz * 0.7, sz * 0.12);
+    // Icon: default cube face (simple eyes)
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    const ew = sz * 0.15, eh = sz * 0.2;
+    ctx.fillRect(-h + sz * 0.23, -h + sz * 0.24, ew, eh);
+    ctx.fillRect(-h + sz * 0.62, -h + sz * 0.24, ew, eh);
 
     ctx.restore();
 }
